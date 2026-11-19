@@ -1,6 +1,6 @@
 # Static quantization for RTen: a sample Harbor task
 
-This is the one task Klinto publishes. It shows the format we deliver and how we test it. It was generated with a model and then reviewed by an engineer.
+This is the one task Klinto publishes. It shows the format we deliver and how we test it.
 
 The brief asks an agent to add the ONNX `QLinearConv` and `QLinearMatMul` operators to [RTen](https://github.com/robertknight/rten), a Rust ONNX runtime. The agent also has to fuse quantize/dequantize patterns into them and add `calibrate` and `quantize` commands. Those commands must stay within 256 MiB of memory on a model with 512 MiB of weights. The full brief is in [instruction.md](../instruction.md).
 
@@ -74,4 +74,4 @@ Its step-by-step trajectory is in [trajectories/](../trajectories/2026-11-19__00
 
 ## Licence
 
-Parts of this repository derive from RTen, which is licensed under MIT or Apache-2.0. See [NOTICE](../NOTICE) and [licenses/rten/](../licenses/rten/). This repository is not affiliated with or endorsed by the RTen project.
+Some files here contain material from RTen, which is licensed under MIT or Apache-2.0. [NOTICE](../NOTICE) lists them, and RTen's licence texts are in [licenses/rten/](../licenses/rten/). This repository is not affiliated with or endorsed by the RTen project.
