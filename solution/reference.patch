@@ -1,0 +1,4728 @@
+diff --git a/docs/quantization.md b/docs/quantization.md
+index 76113fdcacd1dce21072c18584d433aa1a812c52..e9c6d3de782e1ecb876839273694c4a0614a7d58 100644
+--- a/docs/quantization.md
++++ b/docs/quantization.md
+@@ -151,9 +151,9 @@ advantage of this.
+ ONNX quantization allows the use of different int8 signed-ness (`uint8` vs `int8`)
+ for weights and activations.
+ 
+-For models using the `ConvInteger` and `MatMulInteger` operations, RTen is
+-currently optimized for the case where activations are uint8 and weights are
+-int8. This is the default choice used by ONNX's dynamic quantization tool and
++For models using the `ConvInteger`, `MatMulInteger`, `QLinearConv` and
++`QLinearMatMul` operations, RTen is currently optimized for the case where
++activations are uint8 and weights are int8. This is the default choice used by ONNX's dynamic quantization tool and
+ [ort-quantize.py][ort-quantize]. Other combinations are supported, but may
+ encounter slower performance due to RTen internally converting to the preferred
+ format.
+@@ -164,12 +164,16 @@ RTen supports per-tensor and per-channel quantization for the `QuantizeLinear`,
+ `DequantizeLinear` and `MatMulInteger` operations. There is no performance
+ advantage to using per-tensor quantization over per-channel.
+ 
++For `QLinearConv` and `QLinearMatMul`, activations and outputs must use
++per-tensor quantization, while weights can use per-tensor or per-channel
++quantization.
++
+ ### Supported symmetry
+ 
+-For `MatMulInteger` and `ConvInteger`, RTen always uses assumes asymmetric
+-quantization internally (ie. it assumes the zero point may be non-zero). Hence
+-there is no performance advantage to using symmetric quantization, as there may
+-be in some other runtimes.
++For `MatMulInteger`, `ConvInteger`, `QLinearConv` and `QLinearMatMul`, RTen
++always assumes asymmetric quantization internally (ie. it assumes the zero
++point may be non-zero). Hence there is no performance advantage to using
++symmetric quantization, as there may be in some other runtimes.
+ 
+ For `MatMulNBits`, only symmetric quantization (no zero point) is currently
+ supported.
+@@ -177,10 +181,45 @@ supported.
+ ### Supported operators
+ 
+ RTen supports the quantization operators
+-`QuantizeLinear`, `DequantizeLinear` and `DynamicQuantizeLinear`, as well as
+-the integer compute operators `MatMulInteger` and `ConvInteger`. It does not
+-support the "Q" operators (`QLinearMatMul`, `QLinearConv`). Support for
+-`MatMulNBits` has been added quite recently, and is not yet fully optimized.
++`QuantizeLinear`, `DequantizeLinear` and `DynamicQuantizeLinear`, the integer
++compute operators `MatMulInteger` and `ConvInteger`, and the "Q" operators
++`QLinearMatMul` and `QLinearConv`. Support for `MatMulNBits` has been added
++quite recently, and is not yet fully optimized.
++
++`QLinearConv` additionally supports the optional int32 bias input.
++
++### Calibrate and export an ONNX model
++
++Supply representative SafeTensors files whose tensor names match the model inputs.
++
++```sh
++rten calibrate model.onnx --sample part1.st -o part1.profile
++rten calibrate model.onnx --sample part2.st -o part2.profile
++rten calibrate model.onnx --profile part1.profile --profile part2.profile -o merged.profile
++rten quantize model.onnx --profile merged.profile --format qoperator -o int8.onnx
++rten quantize model.onnx --sample part1.st --format qdq -o qdq.onnx
++rten optimize qdq.onnx -o fused.onnx
++```
++
++Profiles contain a model fingerprint and per-region ranges. Branches and loop
++iterations contribute when they execute. Merging takes the minimum of the
++lower bounds and the maximum of the upper bounds. Profiles include the identity
++of external weights. Keep an exported model together with its generated data file.
++
++To search for a mix of float and quantized regions, supply the complete bundle
++size in bytes and the maximum absolute output error on validation samples.
++
++```sh
++rten quantize model.onnx --profile merged.profile --format qoperator -o mixed.onnx \
++  --max-bytes 8000000 --max-error 0.02 --validate heldout1.st --validate heldout2.st
++```
++
++The search can take exponential time in the number of observed regions. Error
++bounds apply to the supplied validation samples. The CLI runs the graph with
++RTen and uses Python 3's standard library for ONNX export and profile handling.
++The reference exporter uses symmetric weight ranges and one scale per tensor.
++Integer Conv export supports a constant bias. The optimizer folds a float bias
++only when every channel is exactly representable at its accumulator scale.
+ 
+ ### Saturation hazard on x86_64 CPUs
+ 
+@@ -293,6 +332,9 @@ Y_scaled = Mul(Y, X_scale)
+ ```
+ 
+ To achieve optimal performance, the runtime may "fuse" several steps together.
+-RTen currently has very limited fusion for quantization operators and depending
+-on the model this will have varying cost. Better support for fusion of
+-quantization operators is planned for the future.
++RTen fuses `QuantizeLinear(Op(DequantizeLinear, DequantizeLinear))` patterns
++(known as "QDQ" patterns) around `Conv` and `MatMul` into `QLinearConv` and
++`QLinearMatMul` operators when all the scale and zero point inputs are
++constants with supported shapes and types. Other quantization patterns are not
++currently fused and depending on the model this will have varying cost. Better
++support for fusion of quantization operators is planned for the future.
+diff --git a/rten-cli/src/main.rs b/rten-cli/src/main.rs
+index 54906f3f1fbfe41677fc35f852bbda22ca2aa3a0..27b045a2e03adafe05a2ef2b7b20fc8375212d8b 100644
+--- a/rten-cli/src/main.rs
++++ b/rten-cli/src/main.rs
+@@ -13,6 +13,7 @@ use rten_tensor::TensorView;
+ use rten_tensor::prelude::*;
+ 
+ mod dim_size;
++mod quant;
+ use dim_size::DimSize;
+ mod input_generator;
+ use input_generator::RandomInputGenerator;
+@@ -436,6 +437,8 @@ fn rten_value(value: rten_serialize::Value) -> Result<Value, Box<dyn Error>> {
+ 
+     let value = match value {
+         SV::Float32(tensor) => Value::from(tensor),
++        SV::Bool(t) => Value::from(t.map(|x| i32::from(*x))),
++        SV::Int64(t) => Value::from(t.map(|x| *x as i32)),
+         SV::Int32(tensor) => Value::from(tensor),
+         SV::Int8(tensor) => Value::from(tensor),
+         SV::UInt8(tensor) => Value::from(tensor),
+@@ -468,6 +471,13 @@ fn read_safetensors(path: &Path) -> Result<HashMap<String, Value>, Box<dyn Error
+ /// To get detailed timing information set the `RTEN_TIMING` env var before
+ /// running. See `docs/profiling.md`.
+ fn main() {
++    if let Some(code) = quant::dispatch() {
++        std::process::exit(if code == std::process::ExitCode::SUCCESS {
++            0
++        } else {
++            1
++        });
++    }
+     let args: Args = argh::from_env();
+ 
+     // Handle --version flag
+diff --git a/rten-cli/src/quant.rs b/rten-cli/src/quant.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..0b39062349ec3bde99c0636546960c5ead012202
+--- /dev/null
++++ b/rten-cli/src/quant.rs
+@@ -0,0 +1,102 @@
++//! Numerical primitives used by the streaming ONNX transformation driver.
++use rten::{ModelOptions, Value};
++use rten_serialize::View;
++use rten_tensor::AsView;
++use std::error::Error;
++use std::fs::File;
++use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
++use std::path::Path;
++use std::process::{Command, ExitCode};
++
++fn evaluate(args: &[String]) -> Result<(), Box<dyn Error>> {
++    let mut opts = ModelOptions::with_all_ops();
++    opts.enable_optimization(false);
++    opts.prepack_weights(false);
++    let model = unsafe { opts.load_mmap(&args[0]) }?;
++    let feed = super::read_safetensors(Path::new(&args[1]))?;
++    let inputs = feed
++        .iter()
++        .map(|(n, v)| Ok((model.node_id(n)?, v.as_view().into())))
++        .collect::<Result<Vec<_>, rten::RunError>>()?;
++    let out = model.run(inputs, model.output_ids(), None)?;
++    let mut values = Vec::new();
++    for (&id, v) in model.output_ids().iter().zip(&out) {
++        let name = model.node_info(id).unwrap().name().unwrap().to_owned();
++        let view: View = match v {
++            Value::FloatTensor(t) => t.view().into(),
++            Value::Int32Tensor(t) => t.view().into(),
++            Value::Int8Tensor(t) => t.view().into(),
++            Value::UInt8Tensor(t) => t.view().into(),
++            _ => return Err("unsupported output".into()),
++        };
++        values.push((name, view));
++    }
++    rten_serialize::safetensors::write_to_file(&args[2], values)?;
++    Ok(())
++}
++
++fn weights(args: &[String]) -> Result<(), Box<dyn Error>> {
++    let mut input = BufReader::new(File::open(&args[0])?);
++    input.seek(SeekFrom::Start(args[1].parse()?))?;
++    let mut bytes: usize = args[2].parse()?;
++    let mut peak = 0.0f32;
++    let mut buffer = vec![0; 262144];
++    let mut output = args
++        .get(3)
++        .map(File::create)
++        .transpose()?
++        .map(BufWriter::new);
++    let scale: f32 = args.get(4).map(|s| s.parse()).transpose()?.unwrap_or(1.);
++    while bytes > 0 {
++        let n = bytes.min(buffer.len());
++        if n % 4 != 0 {
++            return Err("invalid float32 initializer length".into());
++        }
++        input.read_exact(&mut buffer[..n])?;
++        for chunk in buffer[..n].chunks_exact(4) {
++            let x = f32::from_le_bytes(chunk.try_into()?);
++            if !x.is_finite() {
++                return Err("non-finite weight".into());
++            }
++            peak = peak.max(x.abs());
++            if let Some(out) = output.as_mut() {
++                out.write_all(&[(x / scale).round_ties_even().clamp(-127., 127.) as i8 as u8])?;
++            }
++        }
++        bytes -= n;
++    }
++    if let Some(out) = output.as_mut() {
++        out.flush()?;
++    }
++    println!("{peak}");
++    Ok(())
++}
++
++pub fn dispatch() -> Option<ExitCode> {
++    let args: Vec<_> = std::env::args().skip(1).collect();
++    let action = args.first()?.as_str();
++    let result = match action {
++        "_quant_eval" => evaluate(&args[1..]),
++        "_quant_weight" => weights(&args[1..]),
++        "quantize" | "calibrate" | "optimize" => {
++            let mut cmd = Command::new("python3");
++            cmd.arg("-c")
++                .arg(include_str!("quantize.py"))
++                .arg(std::env::current_exe().unwrap())
++                .args(args);
++            match cmd.status() {
++                Ok(s) if s.success() => Ok(()),
++                Ok(_) => return Some(ExitCode::FAILURE),
++                Err(e) => Err(e.into()),
++            }
++        }
++        _ => return None,
++    };
++    Some(match result {
++        Ok(()) => ExitCode::SUCCESS,
++        Err(e) => {
++            eprintln!("{e}");
++            ExitCode::FAILURE
++        }
++    })
++}
+diff --git a/rten-cli/src/quantize.py b/rten-cli/src/quantize.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..4ad5bfbde323b5a747244b2c57da921d828b0483
+--- /dev/null
++++ b/rten-cli/src/quantize.py
+@@ -0,0 +1,767 @@
++"""ONNX graph transforms. Keep large initializer payloads on disk throughout."""
++
++import argparse
++import collections
++import hashlib
++import itertools
++import json
++import math
++import os
++from pathlib import Path
++import struct
++import subprocess
++import sys
++import tempfile
++
++EXE = sys.argv.pop(1)
++
++
++def vint(n):
++    n &= (1 << 64) - 1
++    out = bytearray()
++    while n >= 128:
++        out.append(128 | (n & 127))
++        n >>= 7
++    out.append(n)
++    return bytes(out)
++
++
++def var(b, i):
++    n = 0
++    for shift in range(0, 70, 7):
++        v = b[i]
++        i += 1
++        n |= (v & 127) << shift
++        if v < 128:
++            return n, i
++    raise ValueError("invalid protobuf varint")
++
++
++def message(buf):
++    fields = []
++    i = 0
++    while i < len(buf):
++        key, i = var(buf, i)
++        f, w = divmod(key, 8)
++        if w == 0:
++            val, i = var(buf, i)
++        else:
++            if w == 2:
++                length, i = var(buf, i)
++            else:
++                length = {1: 8, 5: 4}[w]
++            val = buf[i : i + length]
++            if len(val) != length:
++                raise ValueError("truncated protobuf")
++            i += length
++        fields.append((f, w, val))
++    return fields
++
++
++def pack(m):
++    return b"".join(
++        vint(f * 8 + w) + (vint(v) if w == 0 else (vint(len(v)) if w == 2 else b"") + v)
++        for f, w, v in m
++    )
++
++
++def fld(f, v):
++    if isinstance(v, int):
++        return (f, 0, v)
++    return (f, 2, v.encode() if isinstance(v, str) else v)
++
++
++def many(m, f):
++    return [v for k, w, v in m if k == f]
++
++
++def one(m, f, default=None):
++    return next((v for k, w, v in m if k == f), default)
++
++
++def put(m, f, values):
++    return [x for x in m if x[0] != f] + [fld(f, v) for v in values]
++
++
++def strings(m, f):
++    return [b.decode() for b in many(m, f)]
++
++
++def name(m, f):
++    return one(m, f, b"").decode()
++
++
++def child(m, f):
++    return [message(b) for b in many(m, f)]
++
++
++def ints(m, f):
++    out = []
++    for v in many(m, f):
++        if isinstance(v, int):
++            out.append(v)
++        else:
++            i = 0
++            while i < len(v):
++                x, i = var(v, i)
++                out.append(x)
++    return out
++
++
++def sign(x):
++    return x - (1 << 64) if x >= 1 << 63 else x
++
++
++def tensor(n, dt, dims, raw):
++    return [fld(8, n), fld(2, dt), *[fld(1, d) for d in dims], fld(9, raw)]
++
++
++def info(n, dt, dims):
++    shape = pack([fld(1, pack([fld(1, d)])) for d in dims])
++    return pack([fld(1, n), fld(2, pack([fld(1, pack([fld(1, dt), fld(2, shape)]))]))])
++
++
++def node(op, ins, outs, attrs=()):
++    return [
++        fld(4, op),
++        *[fld(1, x) for x in ins],
++        *[fld(2, y) for y in outs],
++        *[fld(5, a) for a in attrs],
++    ]
++
++
++def nm(n):
++    return name(n, 4)
++
++
++def subgraphs(n):
++    for a in child(n, 5):
++        if one(a, 6) is not None:
++            yield name(a, 1), message(one(a, 6))
++
++
++def nested(n, visit):
++    attrs = []
++    for a in child(n, 5):
++        if one(a, 6) is not None:
++            a = put(a, 6, [pack(visit(name(a, 1), message(one(a, 6))))])
++        attrs.append(pack(a))
++    return put(n, 5, attrs)
++
++
++def names(g, f):
++    return [name(v, 1) for v in child(g, f)]
++
++
++def external(t):
++    return {name(e, 1): name(e, 2) for e in child(t, 13)}
++
++
++def set_ext(t, location, offset, length):
++    fields = [x for x in t if x[0] not in (4, 5, 6, 7, 9, 10, 11, 13, 14)]
++    for k, v in [("location", location), ("offset", str(offset)), ("length", str(length))]:
++        fields.append(fld(13, pack([fld(1, k), fld(2, v)])))
++    return fields + [fld(14, 1)]
++
++
++DT = {
++    1: ("F32", "f"),
++    2: ("U8", "B"),
++    3: ("I8", "b"),
++    6: ("I32", "i"),
++    7: ("I64", "q"),
++    9: ("BOOL", "B"),
++    11: ("F64", "d"),
++}
++ST = {s: d for d, (s, _) in DT.items()}
++
++
++def width(dt):
++    return struct.calcsize("<" + DT[dt][1])
++
++
++def typed_raw(t):
++    raw = one(t, 9)
++    if raw is not None:
++        return raw
++    dt = one(t, 2)
++    if dt in (1, 11):
++        return b"".join(many(t, 4 if dt == 1 else 10))
++    values = ints(t, 7 if dt == 7 else 5)
++    mask = (1 << (8 * width(dt))) - 1
++    return b"".join((v & mask).to_bytes(width(dt), "little") for v in values)
++
++
++def blocks(path, offset, length):
++    with path.open("rb") as f:
++        f.seek(offset)
++        while length:
++            buf = f.read(min(length, 1 << 20))
++            if not buf:
++                raise ValueError("truncated external tensor")
++            yield buf
++            length -= len(buf)
++
++
++class Initializer:
++    def __init__(self, t, base):
++        self.t = t
++        self.dt = one(t, 2)
++        self.shape = ints(t, 1)
++        self.length = math.prod(self.shape) * width(self.dt) if self.dt in DT else 0
++        ext = external(t)
++        self.loc = None
++        if ext:
++            self.loc = (
++                (base / ext["location"]).resolve(),
++                int(ext.get("offset", 0)),
++                int(ext.get("length", self.length)),
++            )
++
++    def data(self):
++        return b"".join(blocks(*self.loc)) if self.loc else typed_raw(self.t)
++
++    def value(self):
++        return (self.dt, self.shape, self.data())
++
++    def file(self, tmp):
++        if self.loc:
++            return self.loc
++        raw = typed_raw(self.t)
++        p = tmp / ("inline-" + hashlib.sha256(raw).hexdigest())
++        if not p.exists():
++            p.write_bytes(raw)
++        return p, 0, len(raw)
++
++
++def values(v):
++    return memoryview(v[2]).cast(DT[v[0]][1])
++
++
++def scalar(dt, x):
++    return dt, [], struct.pack("<" + DT[dt][1], x)
++
++
++def read_sample(p):
++    with Path(p).open("rb") as f:
++        n = struct.unpack("<Q", f.read(8))[0]
++        header = json.loads(f.read(n))
++        base = f.tell()
++        out = {}
++        for k, h in header.items():
++            if k == "__metadata__":
++                continue
++            a, b = h["data_offsets"]
++            f.seek(base + a)
++            out[k] = ST[h["dtype"]], h["shape"], f.read(b - a)
++        return out
++
++
++def write_sample(p, data):
++    header = {}
++    off = 0
++    for k, (dt, shape, raw) in data.items():
++        header[k] = {"dtype": DT[dt][0], "shape": shape, "data_offsets": [off, off + len(raw)]}
++        off += len(raw)
++    h = json.dumps(header, separators=(",", ":")).encode()
++    h += b" " * (-len(h) % 8)
++    with p.open("wb") as f:
++        f.write(struct.pack("<Q", len(h)) + h)
++        for _, _, raw in data.values():
++            f.write(raw)
++
++
++def fingerprint(model, base):
++    h = hashlib.sha256(pack(model))
++    seen = set()
++
++    def walk(g):
++        for t in child(g, 5):
++            init = Initializer(t, base)
++            if init.loc and init.loc not in seen:
++                seen.add(init.loc)
++                for chunk in blocks(*init.loc):
++                    h.update(chunk)
++        for n in child(g, 1):
++            for _, sub in subgraphs(n):
++                walk(sub)
++
++    walk(message(one(model, 7)))
++    return h.hexdigest()
++
++
++def extent(data):
++    seq = values(data)
++    if not seq:
++        return None
++    lo, hi = min(seq), max(seq)
++    if not math.isfinite(lo) or not math.isfinite(hi):
++        raise ValueError("non-finite activation")
++    return [lo, hi]
++
++
++def update(ranges, key, span):
++    if span is None:
++        return
++    if key in ranges:
++        span = [min(ranges[key][0], span[0]), max(ranges[key][1], span[1])]
++    ranges[key] = span
++
++
++class Evaluator:
++    def __init__(self, model, base, tmp):
++        self.model = model
++        self.base = base
++        self.tmp = tmp
++
++    def primitive(self, n, env):
++        if nm(n) == "Identity":
++            v = env[strings(n, 1)[0]]
++            return [v.value() if isinstance(v, Initializer) else v]
++        initial = []
++        args = {}
++        meta = []
++        for k in dict.fromkeys(strings(n, 1)):
++            if not k:
++                continue
++            v = env[k]
++            if isinstance(v, Initializer):
++                t = v.t
++                if v.loc:
++                    path, offset, length = v.loc
++                    alias = "storage-" + hashlib.sha256(os.fsencode(path)).hexdigest() + ".data"
++                    dest = self.tmp / alias
++                    if not dest.exists():
++                        dest.symlink_to(path)
++                    t = set_ext(t, alias, offset, length)
++                initial.append(fld(5, pack(put(t, 8, [k]))))
++            else:
++                args[k] = v
++                meta.append(fld(11, info(k, v[0], v[1])))
++        outs = [k for k in strings(n, 2) if k]
++        graph = [
++            fld(2, "evaluate"),
++            fld(1, pack(n)),
++            *initial,
++            *meta,
++            *[fld(12, pack([fld(1, k)])) for k in outs],
++        ]
++        part = self.tmp / "node.onnx"
++        part.write_bytes(pack(put(self.model, 7, [pack(graph)])))
++        inp, out = self.tmp / "feed.st", self.tmp / "out.st"
++        write_sample(inp, args)
++        subprocess.run([EXE, "_quant_eval", part, inp, out], check=True)
++        result = read_sample(out)
++        return [result[k] for k in outs]
++
++    def run(self, g, feeds, scope="root", ranges=None, inherited=None):
++        env = dict(inherited or {})
++        env.update({name(t, 8): Initializer(t, self.base) for t in child(g, 5)})
++        env.update(feeds)
++
++        def val(k):
++            v = env[k]
++            return v.value() if isinstance(v, Initializer) else v
++
++        schedule = child(g, 1)
++        last_use = {}
++        for i, n in enumerate(schedule):
++            dependencies = set(strings(n, 1))
++            for _, sub in subgraphs(n):
++                dependencies.update(uses(sub))
++            for k in dependencies:
++                last_use[k] = i
++        live_out = set(names(g, 12))
++        expired = collections.defaultdict(list)
++        for k, i in last_use.items():
++            if k not in live_out:
++                expired[i].append(k)
++        for i, n in enumerate(schedule):
++            ins, outs = strings(n, 1), [k for k in strings(n, 2) if k]
++            path = f"{scope}/{i}"
++            op = nm(n)
++            if op == "If":
++                branch = "then_branch" if next(iter(values(val(ins[0])))) else "else_branch"
++                sub = dict(subgraphs(n))[branch]
++                result = self.run(sub, {}, path + "/" + branch, ranges, env)
++            elif op == "Loop":
++                sub = dict(subgraphs(n))["body"]
++                si = names(sub, 11)
++                steps = next(iter(values(val(ins[0])))) if ins[0] else sys.maxsize
++                cond = next(iter(values(val(ins[1])))) if ins[1] else True
++                carries = [val(k) for k in ins[2:]]
++                scans = [[] for _ in outs[len(carries) :]]
++                step = 0
++                while step < steps and cond:
++                    feed = dict(zip(si, [scalar(6, step), scalar(6, cond), *carries]))
++                    row = self.run(sub, feed, path + "/body", ranges, env)
++                    cond = next(iter(values(row[0])))
++                    carries = row[1 : 1 + len(carries)]
++                    for scan, v in zip(scans, row[1 + len(carries) :]):
++                        scan.append(v)
++                    step += 1
++
++                def stack(scan):
++                    if not scan:
++                        raise ValueError("cannot infer empty scan shape")
++                    return scan[0][0], [len(scan), *scan[0][1]], b"".join(v[2] for v in scan)
++
++                result = [*carries, *map(stack, scans)]
++            else:
++                result = self.primitive(n, env)
++            env.update(zip(outs, result))
++            if ranges is not None and op in ("Conv", "MatMul") and result[0][0] == 1:
++                for j, k in enumerate([*ins[:2], outs[0]]):
++                    if j == 1 and isinstance(env[k], Initializer):
++                        continue
++                    update(ranges, path + "/" + str(j), extent(val(k)))
++            for k in expired[i]:
++                env.pop(k, None)
++        return [val(k) for k in names(g, 12)]
++
++
++def uses(g):
++    """Names consumed by this graph, including lexical captures."""
++    needed = set(names(g, 12))
++    for n in child(g, 1):
++        needed.update(strings(n, 1))
++        for _, sub in subgraphs(n):
++            needed.update(
++                uses(sub)
++                - set(names(sub, 11))
++                - {name(t, 8) for t in child(sub, 5)}
++                - {k for sn in child(sub, 1) for k in strings(sn, 2)}
++            )
++    return needed
++
++
++def f32(x):
++    return struct.unpack("<f", struct.pack("<f", x))[0]
++
++
++def scale(span):
++    return f32(max(abs(x) for x in span) / 127) or 1.0
++
++
++def attr(n, k, default):
++    for a in child(n, 5):
++        if name(a, 1) == k:
++            return sign(one(a, 3, default))
++    return default
++
++
++def optimize_graph(g, base, fresh, outer=None, types=None):
++    const = dict(outer or {})
++    const.update({name(t, 8): Initializer(t, base) for t in child(g, 5)})
++    desc = dict(types or {})
++    for v in child(g, 11) + child(g, 12) + child(g, 13):
++        tp = one(message(one(v, 2, b"")), 1)
++        if tp:
++            typ = message(tp)
++            shape = one(typ, 2)
++            desc[name(v, 1)] = (
++                one(typ, 1),
++                [one(d, 1) for d in child(message(shape), 1)] if shape is not None else None,
++            )
++    desc.update({k: (v.dt, v.shape) for k, v in const.items()})
++    nodes = [
++        nested(n, lambda _, s: optimize_graph(s, base, fresh, const, desc)) for n in child(g, 1)
++    ]
++    counts = collections.Counter(k for n in nodes for k in strings(n, 1))
++    counts.update(names(g, 12))
++    for n in nodes:
++        for _, s in subgraphs(n):
++            counts.update(uses(s))
++    producers = {k: i for i, n in enumerate(nodes) for k in strings(n, 2)}
++    drop = set()
++    added = []
++
++    def fail_unless(b):
++        if not b:
++            raise ValueError("ineligible")
++
++    def params(s, z):
++        a, b = const[s], const[z]
++        fail_unless(a.dt == 1 and b.dt in (2, 3) and len(a.shape) <= 1 and len(b.shape) <= 1)
++        vals = list(values(a.value()))
++        fail_unless(
++            vals
++            and all(x > 0 and math.isfinite(x) for x in vals)
++            and len(vals) == math.prod(b.shape)
++        )
++        return vals, b.dt
++
++    for i, q in enumerate(nodes):
++        if nm(q) != "QuantizeLinear" or name(q, 7) or len(strings(q, 1)) != 3:
++            continue
++        try:
++            y, ys, yz = strings(q, 1)
++            cidx = producers[y]
++            c = nodes[cidx]
++            ci = strings(c, 1)
++            op = nm(c)
++            fail_unless(op in ("Conv", "MatMul") and not name(c, 7) and counts[y] == 1)
++            a, b = ci[:2]
++            ai, bi = producers[a], producers[b]
++            dx, dw = nodes[ai], nodes[bi]
++            fail_unless(
++                all(nm(n) == "DequantizeLinear" and not name(n, 7) for n in (dx, dw))
++                and counts[a] == counts[b] == 1
++            )
++            x, xs, xz = strings(dx, 1)
++            w, ws, wz = strings(dw, 1)
++            xv, xd = params(xs, xz)
++            wv, wd = params(ws, wz)
++            yv, yd = params(ys, yz)
++            fail_unless(len(xv) == len(yv) == 1 and attr(q, "output_dtype", yd) in (0, yd))
++            fail_unless(desc.get(x, (xd, None))[0] == xd and desc.get(w, (wd, None))[0] == wd)
++            dims = desc.get(w, (wd, None))[1]
++            if len(wv) > 1:
++                fail_unless(dims and (op == "Conv" or len(dims) >= 2))
++                axis = attr(dw, "axis", 1)
++                axis = axis + len(dims) if axis < 0 else axis
++                target = 0 if op == "Conv" else len(dims) - 1
++                fail_unless(axis == target and dims[target] in (len(wv), None))
++            args = [x, xs, xz, w, ws, wz, ys, yz]
++            if len(ci) > 2 and ci[2]:
++                bias = const[ci[2]]
++                fail_unless(op == "Conv" and bias.dt == 1 and len(bias.shape) == 1)
++                nums = list(values(bias.value()))
++                fail_unless(
++                    (not dims or dims[0] in (None, len(nums))) and len(wv) in (1, len(nums))
++                )
++                codes = [v / (xv[0] * wv[j % len(wv)]) for j, v in enumerate(nums)]
++                fail_unless(all(v.is_integer() and -(2**31) <= v < 2**31 for v in codes))
++                bn = fresh()
++                added.append(
++                    tensor(bn, 6, [len(nums)], struct.pack("<" + "i" * len(nums), *map(int, codes)))
++                )
++                args.append(bn)
++            nodes[i] = node("QLinear" + op, args, strings(q, 2), many(c, 5))
++            drop.update([ai, bi, cidx])
++        except (KeyError, ValueError, IndexError):
++            continue
++    return put(
++        put(g, 1, [pack(n) for i, n in enumerate(nodes) if i not in drop]),
++        5,
++        many(g, 5) + list(map(pack, added)),
++    )
++
++
++class Export:
++    def __init__(self, base, tmp, ranges, fmt, mask, model):
++        self.base, self.tmp, self.ranges, self.fmt, self.mask = base, tmp, ranges, fmt, mask
++        self.sequence = 0
++        self.existing = set()
++
++        def reserve(g):
++            self.existing.update(uses(g) | set(names(g, 11)) | {name(t, 8) for t in child(g, 5)})
++            for n in child(g, 1):
++                self.existing.update(strings(n, 2))
++                for _, s in subgraphs(n):
++                    reserve(s)
++
++        reserve(message(one(model, 7)))
++        self.cache = {}
++        self.references = {}
++
++    def fresh(self):
++        while True:
++            self.sequence += 1
++            k = "__quant_" + str(self.sequence)
++            if k not in self.existing:
++                return k
++
++    def graph(self, g, scope="root", outer=None):
++        const = dict(outer or {})
++        const.update({name(t, 8): Initializer(t, self.base) for t in child(g, 5)})
++        initial = child(g, 5)
++        nodes = []
++
++        def add(dt, shape, raw):
++            k = self.fresh()
++            initial.append(tensor(k, dt, shape, raw))
++            return k
++
++        def par(s, dt, z):
++            return [add(1, [], struct.pack("<f", s)), add(dt, [], struct.pack("<" + DT[dt][1], z))]
++
++        def emit(op, inputs, output=None):
++            k = output or self.fresh()
++            nodes.append(node(op, inputs, [k]))
++            return k
++
++        for i, n in enumerate(child(g, 1)):
++            path = f"{scope}/{i}"
++            n = nested(n, lambda k, sub: self.graph(sub, path + "/" + k, const))
++            if path not in self.mask:
++                nodes.append(n)
++                continue
++            ins = strings(n, 1)
++            x, w = ins[:2]
++            y = strings(n, 2)[0]
++            op = nm(n)
++            sx = scale(self.ranges[path + "/0"])
++            sy = scale(self.ranges[path + "/2"])
++            px, py = par(sx, 2, 128), par(sy, 2, 128)
++            qx = emit("QuantizeLinear", [x, *px])
++            if w in const:
++                weight = const[w]
++                loc = weight.file(self.tmp)
++                if loc not in self.cache:
++                    args = [EXE, "_quant_weight", loc[0], str(loc[1]), str(loc[2])]
++                    sw = scale([float(subprocess.check_output(args))])
++                    blob = self.tmp / ("encoded-" + str(len(self.cache)))
++                    subprocess.run([*args, blob, str(sw)], stdout=subprocess.DEVNULL, check=True)
++                    self.cache[loc] = (sw, blob)
++                sw, blob = self.cache[loc]
++                qw = self.fresh()
++                self.references[qw] = (blob, 0, blob.stat().st_size)
++                initial.append(
++                    set_ext(tensor(qw, 3, weight.shape, b""), "placeholder", 0, blob.stat().st_size)
++                )
++                pw = par(sw, 3, 0)
++            else:
++                sw = scale(self.ranges[path + "/1"])
++                pw = par(sw, 3, 0)
++                qw = emit("QuantizeLinear", [w, *pw])
++            if self.fmt == "qdq":
++                dx = emit("DequantizeLinear", [qx, *px])
++                dw = emit("DequantizeLinear", [qw, *pw])
++                fy = self.fresh()
++                nodes.append(node(op, [dx, dw, *ins[2:]], [fy], many(n, 5)))
++                qy = emit("QuantizeLinear", [fy, *py])
++            else:
++                args = [qx, *px, qw, *pw, *py]
++                if len(ins) > 2 and ins[2]:
++                    if ins[2] not in const:
++                        raise ValueError("dynamic Conv bias is unsupported for integer export")
++                    biases = [
++                        max(-(2**31), min(2**31 - 1, round(v / (sx * sw))))
++                        for v in values(const[ins[2]].value())
++                    ]
++                    args.append(
++                        add(6, [len(biases)], struct.pack("<" + "i" * len(biases), *biases))
++                    )
++                qy = self.fresh()
++                nodes.append(node("QLinear" + op, args, [qy], many(n, 5)))
++            emit("DequantizeLinear", [qy, *py], y)
++        out = put(g, 1, list(map(pack, nodes)))
++        wanted = uses(out) | set(names(out, 11))
++        return put(out, 5, [pack(t) for t in initial if name(t, 8) in wanted])
++
++    def bundle(self, model, g, out):
++        offsets = {}
++        side = out.with_name(out.name + ".data")
++        with side.open("wb") as f:
++
++            def relocate(g):
++                tensors = []
++                for t in child(g, 5):
++                    if external(t):
++                        loc = self.references.get(name(t, 8)) or Initializer(t, self.base).loc
++                        if loc not in offsets:
++                            pad = (-f.tell()) % 64
++                            f.write(bytes(pad))
++                            offsets[loc] = f.tell()
++                            for chunk in blocks(*loc):
++                                f.write(chunk)
++                        t = set_ext(t, side.name, offsets[loc], loc[2])
++                    tensors.append(pack(t))
++                return put(
++                    put(g, 5, tensors),
++                    1,
++                    [pack(nested(n, lambda k, s: relocate(s))) for n in child(g, 1)],
++                )
++
++            result = relocate(g)
++        if not side.stat().st_size:
++            side.unlink()
++        data = pack(put(model, 7, [pack(result)]))
++        out.write_bytes(data)
++        return len(data) + (side.stat().st_size if side.exists() else 0)
++
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument("action", choices=["calibrate", "quantize", "optimize"])
++    p.add_argument("model", type=Path)
++    p.add_argument("-o", required=True, type=Path)
++    p.add_argument("--sample", action="append", default=[])
++    p.add_argument("--profile", action="append", default=[])
++    p.add_argument("--validate", action="append", default=[])
++    p.add_argument("--max-bytes", type=int)
++    p.add_argument("--max-error", type=float)
++    p.add_argument("--format", choices=["qoperator", "qdq"])
++    a = p.parse_args()
++    model = message(a.model.read_bytes())
++    graph = message(one(model, 7))
++    base = a.model.resolve().parent
++    ranges = {}
++    with (
++        tempfile.TemporaryDirectory() as d,
++        tempfile.TemporaryDirectory(dir=a.o.resolve().parent) as stage,
++    ):
++        tmp = Path(d)
++        out = Path(stage) / a.o.name
++        if a.action != "optimize":
++            ident = fingerprint(model, base)
++            for f in a.profile:
++                profile = json.loads(Path(f).read_text())
++                if profile["model"] != ident:
++                    raise ValueError("incompatible calibration profile")
++                for k, v in profile["ranges"].items():
++                    update(ranges, k, v)
++            ev = Evaluator(model, base, tmp)
++            for f in a.sample:
++                ev.run(graph, read_sample(f), ranges=ranges)
++            if a.action == "calibrate":
++                out.write_text(json.dumps({"model": ident, "ranges": ranges}, sort_keys=True))
++                out.replace(a.o)
++                return
++            if not a.format:
++                raise ValueError("--format is required")
++        budget = a.max_bytes is not None or a.max_error is not None
++        if budget and (a.max_bytes is None or a.max_error is None or not a.validate):
++            raise ValueError("budgeted export requires byte, error, and validation arguments")
++        keys = sorted({k[:-2] for k in ranges if k.endswith("/2")})
++        expected = [ev.run(graph, read_sample(f)) for f in a.validate] if budget else []
++        candidates = (
++            (itertools.combinations(keys, n) for n in range(len(keys), -1, -1))
++            if budget
++            else [[keys]]
++        )
++        for mask in itertools.chain.from_iterable(candidates):
++            ex = Export(base, tmp, ranges, a.format, set(mask), model)
++            g = optimize_graph(graph, base, ex.fresh) if a.action == "optimize" else ex.graph(graph)
++            size = ex.bundle(model, g, out)
++            if budget:
++                if size > a.max_bytes:
++                    continue
++                result = message(out.read_bytes())
++                evaluator = Evaluator(result, out.parent, tmp)
++                suitable = True
++                for file, ref in zip(a.validate, expected):
++                    got = evaluator.run(message(one(result, 7)), read_sample(file))
++                    for x, y in zip(ref, got):
++                        if x[:2] != y[:2] or any(
++                            not (abs(p - q) <= a.max_error) for p, q in zip(values(x), values(y))
++                        ):
++                            suitable = False
++                            break
++                    if not suitable:
++                        break
++                if not suitable:
++                    continue
++            side = out.with_name(out.name + ".data")
++            if side.exists():
++                side.replace(a.o.with_name(side.name))
++            out.replace(a.o)
++            return
++        raise ValueError("infeasible byte and error limits")
++
++
++try:
++    main()
++except (OSError, ValueError, KeyError, subprocess.SubprocessError) as error:
++    sys.exit(str(error))
+diff --git a/rten-cli/tests/data/linear.onnx b/rten-cli/tests/data/linear.onnx
+new file mode 100644
+index 0000000000000000000000000000000000000000..3f69ab9fe43c5254036470e0ba05153952bb9cd2
+GIT binary patch
+literal 108
+zcmd<!uu9?*RATc@Eb%SP;bN@dVk{S8tQ2C&P0Y;Gl6GP&7hvRI;$ZR;U;u*#dj^Jv
+n{UBzP2vD^UKNl|tqYx(-vk+q*7f@XiP_z<5)QN?QK|lxqw{Z?-
+
+literal 0
+HcmV?d00001
+
+diff --git a/rten-cli/tests/quantized_export.rs b/rten-cli/tests/quantized_export.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..59b99f4fb430b364001b75dc6464e2952ce3c6d8
+--- /dev/null
++++ b/rten-cli/tests/quantized_export.rs
+@@ -0,0 +1,46 @@
++use rten::{ModelOptions, Value};
++use rten_tensor::{AsView, Tensor};
++use std::{fs, process::Command};
++
++#[test]
++fn both_exports_reload_on_held_out_input() {
++    let root = std::env::temp_dir().join(format!(
++        "rten-round-trip-{}-{}",
++        std::process::id(),
++        fastrand::u64(..)
++    ));
++    fs::create_dir(&root).unwrap();
++    let original = root.join("linear.onnx");
++    fs::write(&original, include_bytes!("data/linear.onnx")).unwrap();
++    let sample = root.join("calibration.st");
++    let calibration = Tensor::from_data(&[1, 2], vec![-2f32, 2.]);
++    rten_serialize::safetensors::write_to_file(&sample, [("x", calibration.view())]).unwrap();
++    for format in ["qdq", "qoperator"] {
++        let out = root.join(format!("{format}.onnx"));
++        let status = Command::new(env!("CARGO_BIN_EXE_rten"))
++            .arg("quantize")
++            .arg(&original)
++            .arg("--format")
++            .arg(format)
++            .arg("--sample")
++            .arg(&sample)
++            .arg("-o")
++            .arg(&out)
++            .status()
++            .unwrap();
++        assert!(status.success());
++        let mut opts = ModelOptions::with_all_ops();
++        opts.enable_optimization(false);
++        let m = opts.load_file(out).unwrap();
++        let input = Value::from(Tensor::from_data(&[1, 2], vec![0.5f32, -1.25]));
++        let got = m
++            .run_one(input.into(), None)
++            .unwrap()
++            .into_tensor::<f32>()
++            .unwrap();
++        for (a, b) in got.iter().zip([1.25f32, 0.5]) {
++            assert!((a - b).abs() < 0.04, "{format}: {a} vs {b}");
++        }
++    }
++    fs::remove_dir_all(root).unwrap();
++}
+diff --git a/rten-shape-inference/src/ops.rs b/rten-shape-inference/src/ops.rs
+index df30439cd2d15594914c053dcbfa6a22df5e464d..979ea2aa49436ac790c5b10becb68901b98cb788 100644
+--- a/rten-shape-inference/src/ops.rs
++++ b/rten-shape-inference/src/ops.rs
+@@ -34,7 +34,7 @@ mod unary;
+ pub use attention::{Attention, GroupQueryAttention, MultiHeadAttention};
+ pub use binary::{Add, Div, Equal, Mul, Sub, Where};
+ pub use concat::{Concat, Tile};
+-pub use conv_pool::{Conv, ConvTranspose, GlobalPool, Padding, Pool};
++pub use conv_pool::{Conv, ConvTranspose, GlobalPool, Padding, Pool, QLinearConv};
+ pub use einsum::Einsum;
+ pub use fft::{DFT, STFT};
+ pub use gather::{Gather, GatherElements, GatherND};
+@@ -44,7 +44,7 @@ pub use identity::Identity;
+ pub use layout::{
+     DepthToSpace, Expand, Flatten, Reshape, Shape, Size, Squeeze, Transpose, Unsqueeze,
+ };
+-pub use matmul::{Gemm, MatMul, MatMulNBits};
++pub use matmul::{Gemm, MatMul, MatMulNBits, QLinearMatMul};
+ pub use non_max_suppression::NonMaxSuppression;
+ pub use norm::SkipLayerNormalization;
+ pub use pad::Pad;
+diff --git a/rten-shape-inference/src/ops/conv_pool.rs b/rten-shape-inference/src/ops/conv_pool.rs
+index 40dcdcfb7fd1e2219f9aba9b2061e130ed572c24..a567f15749f2326c26eaf263d2a6e9da806be0b5 100644
+--- a/rten-shape-inference/src/ops/conv_pool.rs
++++ b/rten-shape-inference/src/ops/conv_pool.rs
+@@ -98,75 +98,116 @@ impl InferShapes for Conv<'_> {
+         inputs: InferShapesContext,
+         _sym_gen: &mut SymbolGen,
+     ) -> Result<Vec<SymTensor>, InferShapesError> {
+-        let data = inputs.require(0)?;
+-        let weights = inputs.require(1)?;
++        infer_conv_shapes(
++            &inputs,
++            0, // data
++            1, // weights
++            self.dilations,
++            &self.padding,
++            self.strides,
++        )
++    }
++}
+ 
+-        let Some(data_dims) = data.shape() else {
+-            return Ok([SymTensor::unknown("unknown input shape")].into());
+-        };
+-        let Some(weight_dims) = weights.shape() else {
+-            return Ok([SymTensor::unknown("unknown weights shape")].into());
+-        };
++/// QLinearConv operator.
++///
++/// This is a quantized variant of [`Conv`] where the data and weights are at
++/// inputs 0 and 3 respectively.
++///
++/// See <https://onnx.ai/onnx/operators/onnx__QLinearConv.html>.
++pub struct QLinearConv<'a> {
++    pub dilations: &'a [usize],
++    pub padding: Padding<'a>,
++    pub strides: &'a [usize],
++}
+ 
+-        if data_dims.len() < 3 {
+-            return Err(InferShapesError::IncorrectRank);
+-        }
++impl InferShapes for QLinearConv<'_> {
++    fn infer_shapes(
++        &self,
++        inputs: InferShapesContext,
++        _sym_gen: &mut SymbolGen,
++    ) -> Result<Vec<SymTensor>, InferShapesError> {
++        infer_conv_shapes(
++            &inputs,
++            0, // data
++            3, // weights
++            self.dilations,
++            &self.padding,
++            self.strides,
++        )
++    }
++}
+ 
+-        // First dim of weights and data have a different meaning (batch size
+-        // and output channels respectively), but the ranks should always be
+-        // equal.
+-        if weight_dims.len() != data_dims.len() {
+-            return Err(InferShapesError::IncorrectRank);
+-        }
++/// Infer the output shape of a convolution, given the indices of the data
++/// and weight inputs.
++fn infer_conv_shapes(
++    inputs: &InferShapesContext,
++    data_index: usize,
++    weights_index: usize,
++    dilations: &[usize],
++    padding: &Padding,
++    strides: &[usize],
++) -> Result<Vec<SymTensor>, InferShapesError> {
++    let data = inputs.require(data_index)?;
++    let weights = inputs.require(weights_index)?;
++
++    let Some(data_dims) = data.shape() else {
++        return Ok([SymTensor::unknown("unknown input shape")].into());
++    };
++    let Some(weight_dims) = weights.shape() else {
++        return Ok([SymTensor::unknown("unknown weights shape")].into());
++    };
++
++    if data_dims.len() < 3 {
++        return Err(InferShapesError::IncorrectRank);
++    }
+ 
+-        let data_shape: SmallVec<[_; 4]> = data_dims.collect();
+-        let weight_shape: SmallVec<[_; 4]> = weight_dims.collect();
+-        let spatial_dims = data_shape.len() - 2;
++    // First dim of weights and data have a different meaning (batch size
++    // and output channels respectively), but the ranks should always be
++    // equal.
++    if weight_dims.len() != data_dims.len() {
++        return Err(InferShapesError::IncorrectRank);
++    }
+ 
+-        let pad_h = self
+-            .padding
+-            .dim(0, spatial_dims)
++    let data_shape: SmallVec<[_; 4]> = data_dims.collect();
++    let weight_shape: SmallVec<[_; 4]> = weight_dims.collect();
++    let spatial_dims = data_shape.len() - 2;
++
++    let pad_h = padding
++        .dim(0, spatial_dims)
++        .ok_or(InferShapesError::InvalidValue)?;
++    let out_h = output_size(
++        data_shape[2].clone(),
++        weight_shape[2].clone(),
++        *strides.first().ok_or(InferShapesError::InvalidValue)?,
++        *dilations.first().ok_or(InferShapesError::InvalidValue)?,
++        pad_h,
++        false,
++    );
++
++    let mut out_shape = Vec::with_capacity(data_shape.len());
++    out_shape.push(data_shape[0].clone());
++    out_shape.push(weight_shape[0].clone());
++    out_shape.push(out_h);
++
++    if let Some(in_w) = data_shape.get(3).cloned()
++        && let Some(k_w) = weight_shape.get(3).cloned()
++    {
++        let pad_w = padding
++            .dim(1, spatial_dims)
+             .ok_or(InferShapesError::InvalidValue)?;
+-        let out_h = output_size(
+-            data_shape[2].clone(),
+-            weight_shape[2].clone(),
+-            *self.strides.first().ok_or(InferShapesError::InvalidValue)?,
+-            *self
+-                .dilations
+-                .first()
+-                .ok_or(InferShapesError::InvalidValue)?,
+-            pad_h,
++        let out_w = output_size(
++            in_w,
++            k_w,
++            *strides.get(1).ok_or(InferShapesError::InvalidValue)?,
++            *dilations.get(1).ok_or(InferShapesError::InvalidValue)?,
++            pad_w,
+             false,
+         );
+-
+-        let mut out_shape = Vec::with_capacity(data_shape.len());
+-        out_shape.push(data_shape[0].clone());
+-        out_shape.push(weight_shape[0].clone());
+-        out_shape.push(out_h);
+-
+-        if let Some(in_w) = data_shape.get(3).cloned()
+-            && let Some(k_w) = weight_shape.get(3).cloned()
+-        {
+-            let pad_w = self
+-                .padding
+-                .dim(1, spatial_dims)
+-                .ok_or(InferShapesError::InvalidValue)?;
+-            let out_w = output_size(
+-                in_w,
+-                k_w,
+-                *self.strides.get(1).ok_or(InferShapesError::InvalidValue)?,
+-                *self
+-                    .dilations
+-                    .get(1)
+-                    .ok_or(InferShapesError::InvalidValue)?,
+-                pad_w,
+-                false,
+-            );
+-            out_shape.push(out_w);
+-        }
+-
+-        Ok([SymTensor::from_shape(out_shape)].into())
++        out_shape.push(out_w);
+     }
++
++    Ok([SymTensor::from_shape(out_shape)].into())
+ }
+ 
+ /// Return the output size for a spatial dimension in a transposed
+@@ -395,7 +436,7 @@ mod tests {
+     use crate::sym_gen::SymbolGen;
+     use crate::sym_tensor::{SymTensor, sym_shape};
+ 
+-    use super::{Conv, ConvTranspose, GlobalPool, Padding, Pool};
++    use super::{Conv, ConvTranspose, GlobalPool, Padding, Pool, QLinearConv};
+ 
+     #[test]
+     fn test_conv() {
+@@ -473,6 +514,55 @@ mod tests {
+         );
+     }
+ 
++    #[test]
++    fn test_qlinear_conv() {
++        let mut sym_gen = SymbolGen::new();
++
++        // Data is input 0 and weights are input 3. The scale and zero point
++        // inputs between them are unused for shape inference.
++        let data = sym_shape!("batch", "in_c", "height", "width");
++        let weights = sym_shape!(768, 3, 32, 32);
++        let scalar = SymTensor::from_shape(Vec::new());
++        let op = QLinearConv {
++            padding: Padding::Fixed(&[0, 1, 2, 3]),
++            dilations: &[4, 5],
++            strides: &[16, 32],
++        };
++        let result = op
++            .infer_shapes(
++                [
++                    data,
++                    scalar.clone(),
++                    scalar.clone(),
++                    weights,
++                    scalar.clone(),
++                    scalar.clone(),
++                    scalar.clone(),
++                    scalar,
++                ]
++                .into(),
++                &mut sym_gen,
++            )
++            .unwrap();
++        assert_eq!(
++            result[0],
++            sym_shape!(
++                "batch",
++                768,
++                (SymExpr::from("height") + SymExpr::from(0) + SymExpr::from(2)
++                    - SymExpr::from(4) * (SymExpr::from(32) - SymExpr::from(1))
++                    - SymExpr::from(1))
++                    / SymExpr::from(16)
++                    + SymExpr::from(1),
++                (SymExpr::from("width") + SymExpr::from(1) + SymExpr::from(3)
++                    - SymExpr::from(5) * (SymExpr::from(32) - SymExpr::from(1))
++                    - SymExpr::from(1))
++                    / SymExpr::from(32)
++                    + SymExpr::from(1),
++            )
++        );
++    }
++
+     #[test]
+     fn test_pool() {
+         let mut sym_gen = SymbolGen::new();
+diff --git a/rten-shape-inference/src/ops/matmul.rs b/rten-shape-inference/src/ops/matmul.rs
+index 2725cc3e4fb1d32e21c761773bdcda39fed17f1f..1a57bc2515a0d1f6fce301771766a7dea06d1955 100644
+--- a/rten-shape-inference/src/ops/matmul.rs
++++ b/rten-shape-inference/src/ops/matmul.rs
+@@ -58,46 +58,75 @@ impl InferShapes for MatMul {
+         inputs: InferShapesContext,
+         sym_gen: &mut SymbolGen,
+     ) -> Result<Vec<SymTensor>, InferShapesError> {
+-        let lhs = inputs.require(0)?;
+-        let rhs = inputs.require(1)?;
+-        let Some(mut lhs_dims) = lhs.shape() else {
+-            return Ok([SymTensor::unknown("unknown lhs shape")].into());
+-        };
+-        let Some(mut rhs_dims) = rhs.shape() else {
+-            return Ok([SymTensor::unknown("unknown rhs shape")].into());
+-        };
+-
+-        let lhs_ndim = lhs_dims.len();
+-        let rhs_ndim = rhs_dims.len();
+-
+-        if lhs_ndim < 2 || rhs_ndim < 2 {
+-            // TODO - Handle the case where the LHS or RHS is a vector.
+-            return Ok([SymTensor::unknown("rank < 2")].into());
+-        };
+-
+-        // Output shape is (broadcast(lhs_batch_dims, rhs_batch_dims), M, N)
+-        let lhs_batch_dims = SymTensor::from_shape(lhs_dims.by_ref().take(lhs_ndim - 2).collect());
+-        let rhs_batch_dims = SymTensor::from_shape(rhs_dims.by_ref().take(rhs_ndim - 2).collect());
+-
+-        let [batch_dims] = BinaryOp
+-            .infer_shapes([lhs_batch_dims, rhs_batch_dims].into(), sym_gen)?
+-            .try_into()
+-            .expect("should have one output");
+-
+-        let Some(batch_dims) = batch_dims.shape() else {
+-            return Ok(vec![SymTensor::unknown("unknown batch dims")]);
+-        };
++        infer_matmul_shapes(&inputs, 0, 1, sym_gen)
++    }
++}
+ 
+-        let m = lhs_dims.next().unwrap();
+-        let n = rhs_dims.nth(1).unwrap();
+-        let mut batch_dims: Vec<_> = batch_dims.collect();
+-        batch_dims.push(m);
+-        batch_dims.push(n);
++/// QLinearMatMul operator.
++///
++/// This is a quantized variant of [`MatMul`] where the LHS and RHS matrices
++/// are at inputs 0 and 3 respectively.
++///
++/// See <https://onnx.ai/onnx/operators/onnx__QLinearMatMul.html>.
++pub struct QLinearMatMul;
+ 
+-        Ok(vec![SymTensor::from_shape(batch_dims)])
++impl InferShapes for QLinearMatMul {
++    fn infer_shapes(
++        &self,
++        inputs: InferShapesContext,
++        sym_gen: &mut SymbolGen,
++    ) -> Result<Vec<SymTensor>, InferShapesError> {
++        infer_matmul_shapes(&inputs, 0, 3, sym_gen)
+     }
+ }
+ 
++/// Infer the output shape of a matrix multiplication, given the indices of
++/// the LHS and RHS inputs.
++fn infer_matmul_shapes(
++    inputs: &InferShapesContext,
++    lhs_index: usize,
++    rhs_index: usize,
++    sym_gen: &mut SymbolGen,
++) -> Result<Vec<SymTensor>, InferShapesError> {
++    let lhs = inputs.require(lhs_index)?;
++    let rhs = inputs.require(rhs_index)?;
++    let Some(mut lhs_dims) = lhs.shape() else {
++        return Ok([SymTensor::unknown("unknown lhs shape")].into());
++    };
++    let Some(mut rhs_dims) = rhs.shape() else {
++        return Ok([SymTensor::unknown("unknown rhs shape")].into());
++    };
++
++    let lhs_ndim = lhs_dims.len();
++    let rhs_ndim = rhs_dims.len();
++
++    if lhs_ndim < 2 || rhs_ndim < 2 {
++        // TODO - Handle the case where the LHS or RHS is a vector.
++        return Ok([SymTensor::unknown("rank < 2")].into());
++    };
++
++    // Output shape is (broadcast(lhs_batch_dims, rhs_batch_dims), M, N)
++    let lhs_batch_dims = SymTensor::from_shape(lhs_dims.by_ref().take(lhs_ndim - 2).collect());
++    let rhs_batch_dims = SymTensor::from_shape(rhs_dims.by_ref().take(rhs_ndim - 2).collect());
++
++    let [batch_dims] = BinaryOp
++        .infer_shapes([lhs_batch_dims, rhs_batch_dims].into(), sym_gen)?
++        .try_into()
++        .expect("should have one output");
++
++    let Some(batch_dims) = batch_dims.shape() else {
++        return Ok(vec![SymTensor::unknown("unknown batch dims")]);
++    };
++
++    let m = lhs_dims.next().unwrap();
++    let n = rhs_dims.nth(1).unwrap();
++    let mut batch_dims: Vec<_> = batch_dims.collect();
++    batch_dims.push(m);
++    batch_dims.push(n);
++
++    Ok(vec![SymTensor::from_shape(batch_dims)])
++}
++
+ /// Non-standard MatMulNBits operator.
+ ///
+ /// See <https://github.com/microsoft/onnxruntime/blob/main/docs/ContribOperators.md#com.microsoft.MatMulNBits>.
+@@ -141,7 +170,7 @@ mod tests {
+     use crate::sym_gen::SymbolGen;
+     use crate::sym_tensor::{SymTensor, sym_shape};
+ 
+-    use super::{Gemm, MatMul, MatMulNBits};
++    use super::{Gemm, MatMul, MatMulNBits, QLinearMatMul};
+ 
+     #[test]
+     fn test_gemm() {
+@@ -229,6 +258,34 @@ mod tests {
+         assert_eq!(result[0], SymTensor::unknown("rank < 2"));
+     }
+ 
++    #[test]
++    fn test_qlinear_matmul() {
++        let mut sym_gen = SymbolGen::new();
++
++        // LHS is input 0 and RHS is input 3. The scale and zero point inputs
++        // between them are unused for shape inference.
++        let lhs = sym_shape!("batch", "m", "k");
++        let rhs = sym_shape!("batch", "k", "n");
++        let scalar = SymTensor::from_shape(Vec::new());
++        let result = QLinearMatMul
++            .infer_shapes(
++                [
++                    lhs,
++                    scalar.clone(),
++                    scalar.clone(),
++                    rhs,
++                    scalar.clone(),
++                    scalar.clone(),
++                    scalar.clone(),
++                    scalar,
++                ]
++                .into(),
++                &mut sym_gen,
++            )
++            .unwrap();
++        assert_eq!(result[0], sym_shape!("batch", "m", "n"));
++    }
++
+     #[test]
+     fn test_matmul_n_bits() {
+         let mut sym_gen = SymbolGen::new();
+diff --git a/src/graph/builder.rs b/src/graph/builder.rs
+index d4fbb60a5840cf0bd19691426a84d7c3beee1b72..bdd1afb4e956086c951518f7e959995379875704 100644
+--- a/src/graph/builder.rs
++++ b/src/graph/builder.rs
+@@ -221,6 +221,9 @@ impl Expr {
+                     Value::Int8Tensor(value) => {
+                         graph.add_constant(Some(name.as_str()), value.clone().into_arc())
+                     }
++                    Value::UInt8Tensor(value) => {
++                        graph.add_constant(Some(name.as_str()), value.clone().into_arc())
++                    }
+                     _ => unimplemented!("constant type not supported"),
+                 };
+                 [const_id].into()
+diff --git a/src/model.rs b/src/model.rs
+index 9ce1a17dda35bc876a3d35834dde28e16b08b35d..880901b1f29e6e13af360c426793863aeb86691c 100644
+--- a/src/model.rs
++++ b/src/model.rs
+@@ -1671,6 +1671,7 @@ mod tests {
+ 
+         builder.add_constant("scale", Tensor::from(1.).view());
+         builder.add_constant("zero_point", Tensor::from(0u8).view());
++        builder.add_constant("zero_point.i8", Tensor::from(0i8).view());
+         builder.add_operator(
+             node("DequantizeLinear", &["const.u8", "scale", "zero_point"]).with_attr("axis", 0i64),
+         );
+@@ -1682,6 +1683,39 @@ mod tests {
+         builder.add_operator(
+             node("QuantizeLinear", &["const.f32", "scale", "zero_point"]).with_attr("axis", 0i64),
+         );
++        builder.add_operator(
++            node(
++                "QLinearConv",
++                &[
++                    "input.u8",
++                    "scale",
++                    "zero_point",
++                    "kernel.i8",
++                    "scale",
++                    "zero_point.i8",
++                    "scale",
++                    "zero_point",
++                ],
++            )
++            .with_attr("kernel_shape", vec![1i64, 1])
++            .with_attr("dilations", vec![1i64, 1])
++            .with_attr("group", 1i64)
++            .with_attr("pads", vec![1i64, 1, 1, 1])
++            .with_attr("strides", vec![1i64, 1]),
++        );
++        builder.add_operator(node(
++            "QLinearMatMul",
++            &[
++                "input.2d.u8",
++                "scale",
++                "zero_point",
++                "input.2d.i8",
++                "scale",
++                "zero_point.i8",
++                "scale",
++                "zero_point",
++            ],
++        ));
+ 
+         builder.add_operator(node("Div", &["input", "input"]));
+         #[cfg(feature = "random")]
+diff --git a/src/op_registry.rs b/src/op_registry.rs
+index 7e12b2b97a2fab26eec19d3e9e2725983f116b49..0ae04ec94d3c10fe3618d0b48ec2033f148afa79 100644
+--- a/src/op_registry.rs
++++ b/src/op_registry.rs
+@@ -333,6 +333,8 @@ pub mod op_types {
+     declare_op!(Pad);
+     declare_op!(Pow);
+     declare_op!(PRelu);
++    declare_op!(QLinearConv, onnx_only);
++    declare_op!(QLinearMatMul, onnx_only);
+     declare_op!(QuantizeLinear);
+     declare_op!(RandomNormal, feature = "random");
+     declare_op!(RandomNormalLike, feature = "random");
+diff --git a/src/op_registry/onnx_registry.rs b/src/op_registry/onnx_registry.rs
+index 3970c18de918caa7dd9f901b513837e4c005e444..41473633e05b94ad5b9ff713baeebf96eb021433 100644
+--- a/src/op_registry/onnx_registry.rs
++++ b/src/op_registry/onnx_registry.rs
+@@ -211,6 +211,8 @@ impl OnnxOpRegistry {
+         register_op!(Pad);
+         register_op!(Pow);
+         register_op!(PRelu);
++        register_op!(QLinearConv);
++        register_op!(QLinearMatMul);
+         register_op!(QuantizeLinear);
+         register_op!(RMSNormalization);
+         register_op!(RandomNormal, feature = "random");
+@@ -1027,6 +1029,22 @@ impl_read_op!(ConvInteger, |attrs: &Attrs| {
+     })
+ });
+ 
++impl_read_op!(QLinearConv, |attrs: &Attrs| {
++    let ConvAttrs {
++        dilations,
++        padding,
++        groups,
++        strides,
++    } = get_common_conv_attrs(attrs)?;
++
++    Ok(ops::QLinearConv {
++        dilations,
++        groups,
++        padding,
++        strides,
++    })
++});
++
+ impl ReadOp for ops::ConstantOfShape {
+     fn id() -> OpId<'static> {
+         OpId::new("ConstantOfShape")
+@@ -1410,6 +1428,7 @@ impl_read_op!("com.microsoft", DynamicQuantizeLSTM, |attrs: &Attrs| {
+ 
+ impl_read_op!(MatMul);
+ impl_read_op!(MatMulInteger);
++impl_read_op!(QLinearMatMul);
+ 
+ #[cfg(feature = "contrib")]
+ impl_read_op!("com.microsoft", MatMulNBits, |attrs: &Attrs| {
+diff --git a/src/ops/conv.rs b/src/ops/conv.rs
+index 55a112d59a6d5ead91208479a9b98f113261d299..efb41e7e2389a9dbe22a265c6a797a201db5fa3d 100644
+--- a/src/ops/conv.rs
++++ b/src/ops/conv.rs
+@@ -19,8 +19,11 @@ use crate::operator::{
+ use crate::ops::Padding;
+ use crate::ops::matmul::{OutputScale, cast_scale, shift_cast_gemm_lhs_to_u8, zero_point_to_vec};
+ use crate::ops::pooling::{RoundMode, calc_output_size_and_padding};
++use crate::ops::quantize::{
++    ChannelScales, per_tensor_scale, per_tensor_zero_point, requantize_int32, weight_quant_params,
++};
+ use crate::shift_cast::ShiftCast;
+-use crate::value::{DataType, ValueType, ValueView};
++use crate::value::{DataType, Value, ValueType, ValueView};
+ 
+ mod depthwise;
+ mod im2col;
+@@ -429,6 +432,68 @@ pub fn conv_integer<X, W>(
+     input_zero: Option<TensorView<X>>,
+     kernel_zero: Option<TensorView<W>>,
+ ) -> Result<Tensor<i32>, OpError>
++where
++    X: Copy + Default + ShiftCast<i8>,
++    W: Copy + Default + Into<i16> + ShiftCast<u8> + 'static,
++    for<'a> TensorView<'a, X>: ShiftCast<CowTensor<'a, i8>>,
++    for<'a> TensorView<'a, W>: ShiftCast<CowTensor<'a, u8>>,
++{
++    conv_integer_with_bias(
++        pool,
++        input,
++        kernel,
++        None,
++        padding,
++        groups,
++        strides,
++        dilations,
++        input_zero,
++        kernel_zero,
++    )
++}
++
++/// Variant of [`conv_integer`] which adds an optional bias to the int32
++/// accumulator. The bias is a vector with one value per output channel, as
++/// used by [`QLinearConv`].
++/// Pad the spatial dimensions of an NCW or NCHW tensor with a constant value.
++///
++/// `padding` specifies the amount of `[top, left, bottom, right]` padding.
++/// For 3D inputs the top and bottom padding must be zero.
++fn pad_spatial_dims<X: Copy>(input: TensorView<X>, padding: [usize; 4], pad_value: X) -> Tensor<X> {
++    let [pad_top, pad_left, pad_bottom, pad_right] = padding;
++    if input.ndim() == 3 {
++        let [n, c, w]: [usize; 3] = input.shape().try_into().expect("expected NCW input");
++        assert!(pad_top == 0 && pad_bottom == 0);
++        let mut padded = Tensor::full(&[n, c, w + pad_left + pad_right], pad_value);
++        padded
++            .slice_mut((.., .., pad_left..pad_left + w))
++            .copy_from(&input);
++        padded
++    } else {
++        let [n, c, h, w]: [usize; 4] = input.shape().try_into().expect("expected NCHW input");
++        let mut padded = Tensor::full(
++            &[n, c, h + pad_top + pad_bottom, w + pad_left + pad_right],
++            pad_value,
++        );
++        padded
++            .slice_mut((.., .., pad_top..pad_top + h, pad_left..pad_left + w))
++            .copy_from(&input);
++        padded
++    }
++}
++
++pub(crate) fn conv_integer_with_bias<X, W>(
++    pool: &BufferPool,
++    input: TensorView<X>,
++    kernel: TensorView<W>,
++    bias: Option<NdTensorView<i32, 1>>,
++    padding: Padding,
++    groups: usize,
++    strides: &[usize],
++    dilations: &[usize],
++    input_zero: Option<TensorView<X>>,
++    kernel_zero: Option<TensorView<W>>,
++) -> Result<Tensor<i32>, OpError>
+ where
+     X: Copy + Default + ShiftCast<i8>,
+     W: Copy + Default + Into<i16> + ShiftCast<u8> + 'static,
+@@ -461,11 +526,62 @@ where
+     let (kernel, kernel_zero) = shift_cast_gemm_lhs_to_u8(pool, kernel, kernel_zero);
+     let kernel = kernel.auto_return(pool);
+ 
++    // If padding is used, pad the input explicitly with the input zero point.
++    //
++    // Padding positions in a convolution conceptually have a real value of
++    // zero, which corresponds to the zero point in the quantized domain. The
++    // GEMM-based convolution implementation pads with the default value (ie.
++    // zero in the quantized domain), which is only correct when the zero point
++    // is zero, so pad the input explicitly here when needed.
++    let fixed_padding: Option<[usize; 4]> = match (input.ndim(), strides, dilations) {
++        (3, &[stride], &[dilation]) if kernel.ndim() == 3 => {
++            let padding_2d = padding.expand_1d_to_2d()?;
++            let (_, _, pads) = calc_output_size_and_padding(
++                (1, input.size(2)),
++                (1, kernel.size(2)),
++                (1, stride),
++                padding_2d,
++                Some((1, dilation)),
++                RoundMode::default(),
++            )?;
++            Some(pads)
++        }
++        (4, &[stride_y, stride_x], &[dilation_y, dilation_x]) if kernel.ndim() == 4 => {
++            let (_, _, pads) = calc_output_size_and_padding(
++                (input.size(2), input.size(3)),
++                (kernel.size(2), kernel.size(3)),
++                (stride_y, stride_x),
++                padding.clone(),
++                Some((dilation_y, dilation_x)),
++                RoundMode::default(),
++            )?;
++            Some(pads)
++        }
++        _ => None,
++    };
++
++    let (padded_input, padding) = match fixed_padding {
++        Some(pads) if pads != [0, 0, 0, 0] && input_zero != 0 => {
++            let zero_padding = if input.ndim() == 3 {
++                Padding::zero::<1>()
++            } else {
++                Padding::zero::<2>()
++            };
++            let padded = pad_spatial_dims(input.view(), pads, input_zero);
++            (Some(padded), zero_padding)
++        }
++        _ => (None, padding),
++    };
++    let input = padded_input
++        .as_ref()
++        .map(|padded| padded.view())
++        .unwrap_or_else(|| input.view());
++
+     conv_impl::<i8, u8, i32>(
+         pool,
+-        input.view(),
++        input,
+         kernel.view(),
+-        None, // bias
++        bias,
+         padding,
+         groups,
+         strides,
+@@ -544,6 +660,158 @@ impl_infer_shapes!(
+     }
+ );
+ 
++/// QLinearConv operator.
++///
++/// This performs a convolution on quantized inputs. The zero-point adjusted
++/// products `(x - x_zero_point) * (w - w_zero_point)` are accumulated in int32,
++/// an optional int32 bias with one value per output channel is added, and the
++/// result is requantized to the output type as
++/// `saturate(round_ties_even(acc * x_scale * w_scale / y_scale) + y_zero_point)`.
++///
++/// The input and output scales and zero points must be per-tensor (scalar or
++/// single-element vectors). The weight scale and zero point must have matching
++/// granularity: either both per-tensor or both per-channel, with one entry per
++/// output channel.
++///
++/// The output type is given by the type of the `y_zero_point` input, or
++/// defaults to u8 if it is omitted.
++///
++/// See <https://onnx.ai/onnx/operators/onnx__QLinearConv.html>.
++#[derive(Clone, Debug)]
++pub struct QLinearConv {
++    pub groups: usize,
++    pub dilations: Vec<usize>,
++    pub padding: Padding,
++    pub strides: Vec<usize>,
++}
++
++impl QLinearConv {
++    fn run_typed<X, W>(
++        &self,
++        ctx: &OpRunContext,
++        input: TensorView<X>,
++        input_zero: Option<TensorView<X>>,
++        kernel: TensorView<W>,
++        kernel_zero: Option<TensorView<W>>,
++    ) -> Result<Value, OpError>
++    where
++        X: Copy + Default + ShiftCast<i8>,
++        W: Copy + Default + Into<i16> + ShiftCast<u8> + 'static,
++        for<'a> TensorView<'a, X>: ShiftCast<CowTensor<'a, i8>>,
++        for<'a> TensorView<'a, W>: ShiftCast<CowTensor<'a, u8>>,
++    {
++        let inputs = ctx.inputs();
++        let x_scale = per_tensor_scale(inputs.require_as(1)?)?;
++        let w_scale: TensorView<f32> = inputs.require_as(4)?;
++        let y_scale = per_tensor_scale(inputs.require_as(6)?)?;
++        let y_zero_point = inputs.get(7);
++        let bias: Option<NdTensorView<i32, 1>> = inputs.get_as(8)?;
++
++        let out_chans = if kernel.ndim() >= 1 {
++            kernel.size(0)
++        } else {
++            0
++        };
++        let w_scales = weight_quant_params(w_scale, kernel_zero.as_ref(), out_chans)?;
++        if let Some(zp) = input_zero.as_ref() {
++            per_tensor_zero_point(zp.view())?;
++        }
++
++        let acc = conv_integer_with_bias(
++            ctx.pool(),
++            input,
++            kernel,
++            bias,
++            self.padding.clone(),
++            self.groups,
++            &self.strides,
++            &self.dilations,
++            input_zero,
++            kernel_zero,
++        )?;
++
++        let combined_scales = match &w_scales {
++            ChannelScales::Scalar(w_scale) => ChannelScales::Scalar(x_scale * w_scale / y_scale),
++            ChannelScales::Vector(w_scales) => {
++                ChannelScales::Vector(w_scales.iter().map(|ws| x_scale * ws / y_scale).collect())
++            }
++        };
++
++        // Requantize the accumulator along the output channel axis.
++        match y_zero_point {
++            Some(ValueView::UInt8Tensor(zp)) => {
++                let zp = per_tensor_zero_point(zp)?;
++                requantize_int32(ctx.pool(), acc, &combined_scales, 1, zp).map(Value::from)
++            }
++            Some(ValueView::Int8Tensor(zp)) => {
++                let zp = per_tensor_zero_point(zp)?;
++                requantize_int32(ctx.pool(), acc, &combined_scales, 1, zp).map(Value::from)
++            }
++            None => requantize_int32(ctx.pool(), acc, &combined_scales, 1, 0u8).map(Value::from),
++            _ => Err(OpError::UnsupportedType),
++        }
++    }
++}
++
++impl Operator for QLinearConv {
++    fn name(&self) -> &str {
++        "QLinearConv"
++    }
++
++    fn max_inputs(&self) -> Option<usize> {
++        Some(9)
++    }
++
++    fn run(&self, ctx: &OpRunContext) -> Result<OutputList, OpError> {
++        let inputs = ctx.inputs();
++        let input = inputs.require(0)?;
++        let kernel = inputs.require(3)?;
++
++        macro_rules! qlinear_conv {
++            ($x:expr, $x_ty:ty, $w:expr, $w_ty:ty) => {{
++                let input_zero: Option<TensorView<$x_ty>> = inputs.get_as(2)?;
++                let kernel_zero: Option<TensorView<$w_ty>> = inputs.get_as(5)?;
++                self.run_typed(ctx, $x, input_zero, $w, kernel_zero)
++            }};
++        }
++
++        let result = match (input, kernel) {
++            (ValueView::UInt8Tensor(x), ValueView::UInt8Tensor(w)) => {
++                qlinear_conv!(x, u8, w, u8)
++            }
++            (ValueView::UInt8Tensor(x), ValueView::Int8Tensor(w)) => {
++                qlinear_conv!(x, u8, w, i8)
++            }
++            (ValueView::Int8Tensor(x), ValueView::UInt8Tensor(w)) => {
++                qlinear_conv!(x, i8, w, u8)
++            }
++            (ValueView::Int8Tensor(x), ValueView::Int8Tensor(w)) => {
++                qlinear_conv!(x, i8, w, i8)
++            }
++            _ => Err(OpError::UnsupportedType),
++        };
++        result.into_op_result()
++    }
++
++    fn output_types(&self, _ctx: &OutputTypesContext) -> Option<OutputTypeList> {
++        Some([OutputType::CopyFromInput(7)].into())
++    }
++
++    fn as_infer_shapes(&self) -> Option<&dyn InferShapes> {
++        Some(self)
++    }
++}
++
++impl_infer_shapes!(
++    QLinearConv,
++    op,
++    shape_ops::QLinearConv {
++        strides: &op.strides,
++        dilations: &op.dilations,
++        padding: op.padding.as_shape_inference_padding(),
++    }
++);
++
+ /// Fusion of [`ConvInteger`] with the cast and scaling of its output to float.
+ ///
+ /// This computes `Cast(ConvInteger(x, w, x_zero_point, w_zero_point)) * scale`,
+@@ -599,10 +867,14 @@ mod tests {
+ 
+     use crate::buffer_pool::AutoReturn;
+     use crate::buffer_pool::BufferPool;
+-    use crate::operator::{OpError, OperatorExt};
++    use crate::operator::{InputList, OpError, OperatorExt};
+     use crate::ops::pooling::{RoundMode, calc_output_size_and_padding};
++    use crate::ops::quantize::{ChannelScales, requantize_int32};
+     use crate::ops::tests::expect_eq_1e4;
+-    use crate::ops::{Conv, ConvInteger, ConvIntegerToFloat, Padding, conv, conv_integer};
++    use crate::ops::{
++        Conv, ConvInteger, ConvIntegerToFloat, Padding, QLinearConv, conv, conv_integer,
++    };
++    use crate::value::ValueView;
+ 
+     trait ReferenceConvKernel<X, W> {
+         /// Update a single output element (`self`) with a given input and weight value.
+@@ -1603,6 +1875,547 @@ mod tests {
+         })
+     }
+ 
++    macro_rules! impl_qlinear_conv_test {
++        ($name:ident, $x_ty:ty, $w_ty:ty, $y_ty:ty) => {
++            #[test]
++            fn $name() {
++                let pool = BufferPool::new();
++                let mut rng = XorShiftRng::new(1234);
++                let mut kernel_rng = ReducedRangeRng::new(true /* reduce_range */, 1234);
++
++                let op = QLinearConv {
++                    groups: 1,
++                    dilations: vec![1, 1],
++                    padding: Padding::zero::<2>(),
++                    strides: vec![1, 1],
++                };
++
++                let input = Tensor::<$x_ty>::rand(&[1, 2, 5, 5], &mut rng);
++                let kernel = Tensor::<$w_ty>::rand(&[3, 2, 3, 3], &mut kernel_rng);
++
++                let x_scale_val = 0.1f32;
++                let w_scale_val = 0.02f32;
++                let y_scale_val = 0.15f32;
++                let x_zp_val: $x_ty = 5;
++                let w_zp_val: $w_ty = 3;
++                let y_zp_val: $y_ty = 7;
++
++                let x_scale = Tensor::from(x_scale_val);
++                let x_zp = Tensor::from(x_zp_val);
++                let w_scale = Tensor::from(w_scale_val);
++                let w_zp = Tensor::from(w_zp_val);
++                let y_scale = Tensor::from(y_scale_val);
++                let y_zp = Tensor::from(y_zp_val);
++
++                let inputs: [Option<ValueView>; 8] = [
++                    Some(input.view().into()),
++                    Some(x_scale.view().into()),
++                    Some(x_zp.view().into()),
++                    Some(kernel.view().into()),
++                    Some(w_scale.view().into()),
++                    Some(w_zp.view().into()),
++                    Some(y_scale.view().into()),
++                    Some(y_zp.view().into()),
++                ];
++                let result: Tensor<$y_ty> = op
++                    .run_simple(InputList::from_optional(&inputs))
++                    .expect("QLinearConv failed");
++
++                let out_chans = kernel.size(0);
++                let acc = reference_conv::<$x_ty, $w_ty, i32>(
++                    input.view(),
++                    kernel.view(),
++                    None,
++                    Padding::zero::<2>(),
++                    1,
++                    &[1, 1],
++                    &[1, 1],
++                    Some(x_zp_val),
++                    Some(&vec![w_zp_val; out_chans]),
++                );
++                let combined = ChannelScales::Scalar(x_scale_val * w_scale_val / y_scale_val);
++                let expected: Tensor<$y_ty> =
++                    requantize_int32(&pool, acc, &combined, 1, y_zp_val).unwrap();
++                expect_equal(&result, &expected).unwrap();
++            }
++        };
++    }
++
++    // Test all combinations of input, weight and output signed-ness.
++    impl_qlinear_conv_test!(test_qlinear_conv_u8_u8_u8, u8, u8, u8);
++    impl_qlinear_conv_test!(test_qlinear_conv_u8_u8_i8, u8, u8, i8);
++    impl_qlinear_conv_test!(test_qlinear_conv_u8_i8_u8, u8, i8, u8);
++    impl_qlinear_conv_test!(test_qlinear_conv_u8_i8_i8, u8, i8, i8);
++    impl_qlinear_conv_test!(test_qlinear_conv_i8_u8_u8, i8, u8, u8);
++    impl_qlinear_conv_test!(test_qlinear_conv_i8_u8_i8, i8, u8, i8);
++    impl_qlinear_conv_test!(test_qlinear_conv_i8_i8_u8, i8, i8, u8);
++    impl_qlinear_conv_test!(test_qlinear_conv_i8_i8_i8, i8, i8, i8);
++
++    #[test]
++    fn test_qlinear_conv_per_channel_weights() {
++        let pool = BufferPool::new();
++        let mut rng = XorShiftRng::new(1234);
++        let mut kernel_rng = ReducedRangeRng::new(true /* reduce_range */, 1234);
++
++        let op = QLinearConv {
++            groups: 1,
++            dilations: vec![1, 1],
++            padding: Padding::zero::<2>(),
++            strides: vec![1, 1],
++        };
++
++        let input = Tensor::<u8>::rand(&[1, 2, 5, 5], &mut rng);
++        let kernel = Tensor::<i8>::rand(&[3, 2, 3, 3], &mut kernel_rng);
++        let out_chans = kernel.size(0);
++
++        let x_scale_val = 0.1f32;
++        let y_scale_val = 0.15f32;
++        let (x_zp_val, y_zp_val) = (5u8, 7u8);
++        let w_scales: Vec<f32> = (0..out_chans).map(|c| 0.01 + 0.005 * c as f32).collect();
++        let w_zps: Vec<i8> = (0..out_chans).map(|c| c as i8).collect();
++
++        let x_scale = Tensor::from(x_scale_val);
++        let x_zp = Tensor::from(x_zp_val);
++        let w_scale = Tensor::from_data(&[out_chans], w_scales.clone());
++        let w_zp = Tensor::from_data(&[out_chans], w_zps.clone());
++        let y_scale = Tensor::from(y_scale_val);
++        let y_zp = Tensor::from(y_zp_val);
++
++        let inputs: [Option<ValueView>; 8] = [
++            Some(input.view().into()),
++            Some(x_scale.view().into()),
++            Some(x_zp.view().into()),
++            Some(kernel.view().into()),
++            Some(w_scale.view().into()),
++            Some(w_zp.view().into()),
++            Some(y_scale.view().into()),
++            Some(y_zp.view().into()),
++        ];
++        let result: Tensor<u8> = op
++            .run_simple(InputList::from_optional(&inputs))
++            .expect("QLinearConv failed");
++
++        let acc = reference_conv::<u8, i8, i32>(
++            input.view(),
++            kernel.view(),
++            None,
++            Padding::zero::<2>(),
++            1,
++            &[1, 1],
++            &[1, 1],
++            Some(x_zp_val),
++            Some(&w_zps),
++        );
++        let combined = ChannelScales::Vector(
++            w_scales
++                .iter()
++                .map(|ws| x_scale_val * ws / y_scale_val)
++                .collect(),
++        );
++        let expected: Tensor<u8> = requantize_int32(&pool, acc, &combined, 1, y_zp_val).unwrap();
++        expect_equal(&result, &expected).unwrap();
++    }
++
++    #[test]
++    fn test_qlinear_conv_bias() {
++        let pool = BufferPool::new();
++        let mut rng = XorShiftRng::new(1234);
++        let mut kernel_rng = ReducedRangeRng::new(true /* reduce_range */, 1234);
++
++        let op = QLinearConv {
++            groups: 1,
++            dilations: vec![1, 1],
++            padding: Padding::zero::<2>(),
++            strides: vec![1, 1],
++        };
++
++        let input = Tensor::<u8>::rand(&[1, 2, 4, 4], &mut rng);
++        let kernel = Tensor::<i8>::rand(&[3, 2, 3, 3], &mut kernel_rng);
++        let out_chans = kernel.size(0);
++        let bias = Tensor::from([10i32, -20, 30]);
++
++        let x_scale_val = 0.1f32;
++        let w_scale_val = 0.02f32;
++        let y_scale_val = 0.15f32;
++        let (x_zp_val, w_zp_val, y_zp_val) = (5u8, 3i8, 7u8);
++
++        let x_scale = Tensor::from(x_scale_val);
++        let x_zp = Tensor::from(x_zp_val);
++        let w_scale = Tensor::from(w_scale_val);
++        let w_zp = Tensor::from(w_zp_val);
++        let y_scale = Tensor::from(y_scale_val);
++        let y_zp = Tensor::from(y_zp_val);
++
++        let inputs: [Option<ValueView>; 9] = [
++            Some(input.view().into()),
++            Some(x_scale.view().into()),
++            Some(x_zp.view().into()),
++            Some(kernel.view().into()),
++            Some(w_scale.view().into()),
++            Some(w_zp.view().into()),
++            Some(y_scale.view().into()),
++            Some(y_zp.view().into()),
++            Some(bias.view().into()),
++        ];
++        let result: Tensor<u8> = op
++            .run_simple(InputList::from_optional(&inputs))
++            .expect("QLinearConv failed");
++
++        let acc = reference_conv::<u8, i8, i32>(
++            input.view(),
++            kernel.view(),
++            Some(bias.nd_view()),
++            Padding::zero::<2>(),
++            1,
++            &[1, 1],
++            &[1, 1],
++            Some(x_zp_val),
++            Some(&vec![w_zp_val; out_chans]),
++        );
++        let combined = ChannelScales::Scalar(x_scale_val * w_scale_val / y_scale_val);
++        let expected: Tensor<u8> = requantize_int32(&pool, acc, &combined, 1, y_zp_val).unwrap();
++        expect_equal(&result, &expected).unwrap();
++    }
++
++    #[test]
++    fn test_qlinear_conv_attrs() {
++        let pool = BufferPool::new();
++
++        fn check(
++            pool: &BufferPool,
++            input: &Tensor<u8>,
++            kernel: &Tensor<i8>,
++            padding: Padding,
++            groups: usize,
++            strides: &[usize],
++            dilations: &[usize],
++        ) {
++            let op = QLinearConv {
++                groups,
++                dilations: dilations.to_vec(),
++                padding: padding.clone(),
++                strides: strides.to_vec(),
++            };
++
++            let x_scale_val = 0.1f32;
++            let w_scale_val = 0.02f32;
++            let y_scale_val = 0.15f32;
++            let (x_zp_val, w_zp_val, y_zp_val) = (5u8, 3i8, 7u8);
++
++            let x_scale = Tensor::from(x_scale_val);
++            let x_zp = Tensor::from(x_zp_val);
++            let w_scale = Tensor::from(w_scale_val);
++            let w_zp = Tensor::from(w_zp_val);
++            let y_scale = Tensor::from(y_scale_val);
++            let y_zp = Tensor::from(y_zp_val);
++
++            let inputs: [Option<ValueView>; 8] = [
++                Some(input.view().into()),
++                Some(x_scale.view().into()),
++                Some(x_zp.view().into()),
++                Some(kernel.view().into()),
++                Some(w_scale.view().into()),
++                Some(w_zp.view().into()),
++                Some(y_scale.view().into()),
++                Some(y_zp.view().into()),
++            ];
++            let result: Tensor<u8> = op
++                .run_simple(InputList::from_optional(&inputs))
++                .expect("QLinearConv failed");
++
++            let out_chans = kernel.size(0);
++            let acc = reference_conv::<u8, i8, i32>(
++                input.view(),
++                kernel.view(),
++                None,
++                padding,
++                groups,
++                strides,
++                dilations,
++                Some(x_zp_val),
++                Some(&vec![w_zp_val; out_chans]),
++            );
++            let combined = ChannelScales::Scalar(x_scale_val * w_scale_val / y_scale_val);
++            let expected: Tensor<u8> = requantize_int32(pool, acc, &combined, 1, y_zp_val).unwrap();
++            expect_equal(&result, &expected).unwrap();
++        }
++
++        let mut rng = XorShiftRng::new(1234);
++        let mut kernel_rng = ReducedRangeRng::new(true /* reduce_range */, 1234);
++
++        // Strided convolution with padding.
++        let input = Tensor::<u8>::rand(&[1, 2, 6, 6], &mut rng);
++        let kernel = Tensor::<i8>::rand(&[3, 2, 3, 3], &mut kernel_rng);
++        check(
++            &pool,
++            &input,
++            &kernel,
++            Padding::Fixed([1, 1, 1, 1].into()),
++            1,
++            &[2, 2],
++            &[1, 1],
++        );
++
++        // Dilated convolution with padding.
++        let input = Tensor::<u8>::rand(&[1, 2, 8, 8], &mut rng);
++        let kernel = Tensor::<i8>::rand(&[2, 2, 3, 3], &mut kernel_rng);
++        check(
++            &pool,
++            &input,
++            &kernel,
++            Padding::Fixed([2, 2, 2, 2].into()),
++            1,
++            &[1, 1],
++            &[2, 2],
++        );
++
++        // Grouped convolution.
++        let input = Tensor::<u8>::rand(&[1, 4, 5, 5], &mut rng);
++        let kernel = Tensor::<i8>::rand(&[4, 2, 3, 3], &mut kernel_rng);
++        check(
++            &pool,
++            &input,
++            &kernel,
++            Padding::zero::<2>(),
++            2,
++            &[1, 1],
++            &[1, 1],
++        );
++    }
++
++    #[test]
++    fn test_qlinear_conv_no_zero_points() {
++        let pool = BufferPool::new();
++        let mut rng = XorShiftRng::new(1234);
++        let mut kernel_rng = ReducedRangeRng::new(true /* reduce_range */, 1234);
++
++        let op = QLinearConv {
++            groups: 1,
++            dilations: vec![1, 1],
++            padding: Padding::zero::<2>(),
++            strides: vec![1, 1],
++        };
++
++        let input = Tensor::<u8>::rand(&[1, 2, 5, 5], &mut rng);
++        let kernel = Tensor::<i8>::rand(&[3, 2, 3, 3], &mut kernel_rng);
++
++        let x_scale_val = 0.1f32;
++        let w_scale_val = 0.02f32;
++        let y_scale_val = 0.15f32;
++
++        let x_scale = Tensor::from(x_scale_val);
++        let w_scale = Tensor::from(w_scale_val);
++        let y_scale = Tensor::from(y_scale_val);
++
++        // Omit the input, weight and output zero points. The output type then
++        // defaults to u8 with a zero point of zero.
++        let inputs: [Option<ValueView>; 8] = [
++            Some(input.view().into()),
++            Some(x_scale.view().into()),
++            None,
++            Some(kernel.view().into()),
++            Some(w_scale.view().into()),
++            None,
++            Some(y_scale.view().into()),
++            None,
++        ];
++        let result: Tensor<u8> = op
++            .run_simple(InputList::from_optional(&inputs))
++            .expect("QLinearConv failed");
++
++        let acc = reference_conv::<u8, i8, i32>(
++            input.view(),
++            kernel.view(),
++            None,
++            Padding::zero::<2>(),
++            1,
++            &[1, 1],
++            &[1, 1],
++            None,
++            None,
++        );
++        let combined = ChannelScales::Scalar(x_scale_val * w_scale_val / y_scale_val);
++        let expected: Tensor<u8> = requantize_int32(&pool, acc, &combined, 1, 0u8).unwrap();
++        expect_equal(&result, &expected).unwrap();
++    }
++
++    #[test]
++    fn test_qlinear_conv_rounding_and_saturation() {
++        let op = QLinearConv {
++            groups: 1,
++            dilations: vec![1, 1],
++            padding: Padding::zero::<2>(),
++            strides: vec![1, 1],
++        };
++
++        // Rounding. The accumulator values [50, 150, 200, 0] scaled by 0.05
++        // give [2.5, 7.5, 10, 0] which round (ties to even) to [2, 8, 10, 0].
++        let input = Tensor::from_data(&[1, 1, 2, 2], vec![50u8, 150, 200, 0]);
++        let kernel = Tensor::from_data(&[1, 1, 1, 1], vec![1i8]);
++        let x_scale = Tensor::from(0.05f32);
++        let x_zp = Tensor::from(0u8);
++        let w_scale = Tensor::from(1f32);
++        let w_zp = Tensor::from(0i8);
++        let y_scale = Tensor::from(1f32);
++        let y_zp = Tensor::from(0u8);
++
++        let inputs: [Option<ValueView>; 8] = [
++            Some(input.view().into()),
++            Some(x_scale.view().into()),
++            Some(x_zp.view().into()),
++            Some(kernel.view().into()),
++            Some(w_scale.view().into()),
++            Some(w_zp.view().into()),
++            Some(y_scale.view().into()),
++            Some(y_zp.view().into()),
++        ];
++        let result: Tensor<u8> = op.run_simple(InputList::from_optional(&inputs)).unwrap();
++        assert_eq!(result, Tensor::from_data(&[1, 1, 2, 2], vec![2, 8, 10, 0]));
++
++        // Saturation. The accumulators 255 * 127 = 32385 and 255 * -128 =
++        // -32640 saturate to the i8 range [-128, 127].
++        let input = Tensor::from_data(&[1, 1, 1, 1], vec![255u8]);
++        let kernel = Tensor::from_data(&[2, 1, 1, 1], vec![127i8, -128]);
++        let x_scale = Tensor::from(1f32);
++        let x_zp = Tensor::from(0u8);
++        let w_scale = Tensor::from(1f32);
++        let w_zp = Tensor::from(0i8);
++        let y_scale = Tensor::from(1f32);
++        let y_zp = Tensor::from(0i8);
++
++        let inputs: [Option<ValueView>; 8] = [
++            Some(input.view().into()),
++            Some(x_scale.view().into()),
++            Some(x_zp.view().into()),
++            Some(kernel.view().into()),
++            Some(w_scale.view().into()),
++            Some(w_zp.view().into()),
++            Some(y_scale.view().into()),
++            Some(y_zp.view().into()),
++        ];
++        let result: Tensor<i8> = op.run_simple(InputList::from_optional(&inputs)).unwrap();
++        assert_eq!(result, Tensor::from_data(&[1, 2, 1, 1], vec![127, -128]));
++    }
++
++    #[test]
++    fn test_qlinear_conv_errors() {
++        let op = QLinearConv {
++            groups: 1,
++            dilations: vec![1, 1],
++            padding: Padding::zero::<2>(),
++            strides: vec![1, 1],
++        };
++        let input = Tensor::from_data(&[1, 1, 2, 2], vec![10u8; 4]);
++        let kernel = Tensor::from_data(&[2, 1, 1, 1], vec![1i8; 2]);
++
++        // Valid parameters for each quantization input. Individual cases
++        // override one of these.
++        let x_scale_ok = Tensor::from(0.1f32);
++        let x_zp_ok = Tensor::from(0u8);
++        let w_scale_ok = Tensor::from(0.1f32);
++        let w_zp_ok = Tensor::from(0i8);
++        let y_scale_ok = Tensor::from(0.1f32);
++        let y_zp_ok = Tensor::from(0u8);
++
++        let run = |params: &[Option<ValueView>; 6]| -> Result<Tensor<u8>, OpError> {
++            let inputs: [Option<ValueView>; 8] = [
++                Some(input.view().into()),
++                params[0].clone(),
++                params[1].clone(),
++                Some(kernel.view().into()),
++                params[2].clone(),
++                params[3].clone(),
++                params[4].clone(),
++                params[5].clone(),
++            ];
++            op.run_simple(InputList::from_optional(&inputs))
++        };
++
++        let ok_params: [Option<ValueView>; 6] = [
++            Some(x_scale_ok.view().into()),
++            Some(x_zp_ok.view().into()),
++            Some(w_scale_ok.view().into()),
++            Some(w_zp_ok.view().into()),
++            Some(y_scale_ok.view().into()),
++            Some(y_zp_ok.view().into()),
++        ];
++
++        // Valid case.
++        assert!(run(&ok_params).is_ok());
++
++        // Multi-element activation scale.
++        let x_scale = Tensor::from([0.1f32, 0.2]);
++        let mut params = ok_params.clone();
++        params[0] = Some(x_scale.view().into());
++        assert_eq!(
++            run(&params),
++            Err(OpError::unsupported_value(
++                "only per-tensor scales are supported for this input"
++            ))
++        );
++
++        // Multi-element activation zero point.
++        let x_zp = Tensor::from([0u8, 1]);
++        let mut params = ok_params.clone();
++        params[1] = Some(x_zp.view().into());
++        assert_eq!(
++            run(&params),
++            Err(OpError::unsupported_value(
++                "only per-tensor zero points are supported for this input"
++            ))
++        );
++
++        // Per-tensor weight scale with per-channel zero point.
++        let w_zp = Tensor::from([0i8, 0]);
++        let mut params = ok_params.clone();
++        params[3] = Some(w_zp.view().into());
++        assert_eq!(
++            run(&params),
++            Err(OpError::invalid_value(
++                "scale and zero point must have the same granularity"
++            ))
++        );
++
++        // Per-channel weight scale with per-tensor zero point.
++        let w_scale = Tensor::from([0.1f32, 0.2]);
++        let mut params = ok_params.clone();
++        params[2] = Some(w_scale.view().into());
++        assert_eq!(
++            run(&params),
++            Err(OpError::invalid_value(
++                "scale and zero point must have the same granularity"
++            ))
++        );
++
++        // Weight scale length does not match output channel count.
++        let w_scale = Tensor::from([0.1f32, 0.2, 0.3]);
++        let w_zp = Tensor::from([0i8, 0, 0]);
++        let mut params = ok_params.clone();
++        params[2] = Some(w_scale.view().into());
++        params[3] = Some(w_zp.view().into());
++        assert_eq!(
++            run(&params),
++            Err(OpError::incompatible_input_shapes(
++                "scale length does not match channel count"
++            ))
++        );
++
++        // Zero output scale.
++        let y_scale = Tensor::from(0f32);
++        let mut params = ok_params.clone();
++        params[4] = Some(y_scale.view().into());
++        assert_eq!(
++            run(&params),
++            Err(OpError::invalid_value("scale must be positive and finite"))
++        );
++
++        // Output zero point with unsupported type.
++        let y_zp = Tensor::from(0f32);
++        let mut params = ok_params.clone();
++        params[5] = Some(y_zp.view().into());
++        assert_eq!(run(&params), Err(OpError::UnsupportedType));
++    }
++
+     #[ignore]
+     #[test]
+     fn bench_depthwise_conv() {
+@@ -1644,4 +2457,56 @@ mod tests {
+ 
+         println!("depthwise_conv {elapsed:.3}ms",);
+     }
++
++    #[test]
++    fn test_qlinear_conv_single_element_vector_params() {
++        // Scales and zero points for activations and outputs may be either
++        // scalars or single-element vectors.
++        let pool = BufferPool::new();
++        let mut rng = XorShiftRng::new(1234);
++
++        let op = QLinearConv {
++            groups: 1,
++            dilations: vec![1],
++            padding: Padding::zero::<1>(),
++            strides: vec![1],
++        };
++        let input = Tensor::<u8>::rand(&[1, 2, 8], &mut rng);
++        let kernel = Tensor::<i8>::rand(&[3, 2, 3], &mut rng);
++        let x_scale = Tensor::from([0.1f32]);
++        let x_zp = Tensor::from([5u8]);
++        let w_scale = Tensor::from([0.02f32]);
++        let w_zp = Tensor::from([1i8]);
++        let y_scale = Tensor::from([0.15f32]);
++        let y_zp = Tensor::from([7u8]);
++        let inputs: [Option<ValueView>; 9] = [
++            Some(input.view().into()),
++            Some(x_scale.view().into()),
++            Some(x_zp.view().into()),
++            Some(kernel.view().into()),
++            Some(w_scale.view().into()),
++            Some(w_zp.view().into()),
++            Some(y_scale.view().into()),
++            Some(y_zp.view().into()),
++            None,
++        ];
++        let result: Tensor<u8> = op
++            .run_simple(InputList::from_optional(&inputs))
++            .expect("QLinearConv failed");
++
++        let acc = reference_conv::<u8, i8, i32>(
++            input.view(),
++            kernel.view(),
++            None,
++            Padding::zero::<1>(),
++            1,
++            &[1],
++            &[1],
++            Some(5),
++            Some(&vec![1; 3]),
++        );
++        let combined = ChannelScales::Scalar(0.1 * 0.02 / 0.15);
++        let expected: Tensor<u8> = requantize_int32(&pool, acc, &combined, 1, 7).unwrap();
++        expect_equal(&result, &expected).unwrap();
++    }
+ }
+diff --git a/src/ops/matmul.rs b/src/ops/matmul.rs
+index 88d1ede064c635c016ccf8fe5469f4e968ab3674..4c01b203cfb55b8f5c83dd9c0b472feeefe387d2 100644
+--- a/src/ops/matmul.rs
++++ b/src/ops/matmul.rs
+@@ -20,8 +20,11 @@ use crate::operator::{
+ };
+ use crate::ops::binary_elementwise::broadcast_shapes;
+ use crate::ops::layout::expand_to;
++use crate::ops::quantize::{
++    ChannelScales, per_tensor_scale, per_tensor_zero_point, requantize_int32, weight_quant_params,
++};
+ use crate::shift_cast::ShiftCast;
+-use crate::value::{DataType, ValueType, ValueView};
++use crate::value::{DataType, Value, ValueType, ValueView};
+ 
+ /// Compute the General Matrix Multiplication (GEMM) `c = alpha * (ab) + beta * c`.
+ ///
+@@ -518,7 +521,12 @@ pub fn zero_point_to_vec<T>(
+     match zero_point {
+         Some(zp) if zp.ndim() == 0 => Ok(Some(zp.broadcast([expected_len]))),
+         Some(zp) if zp.ndim() == 1 => {
+-            if zp.size(0) != expected_len {
++            if zp.size(0) == 1 {
++                // Treat a single-element vector zero point as per-tensor. This
++                // deviates from the ONNX spec but matches ONNX Runtime and is
++                // consistent with how single-element vector scales are treated.
++                Ok(Some(zp.broadcast([expected_len])))
++            } else if zp.size(0) != expected_len {
+                 Err(OpError::invalid_value("Zero point has incorrect size"))
+             } else {
+                 Ok(Some(zp.nd_view()))
+@@ -706,6 +714,150 @@ impl Operator for MatMulInteger {
+     }
+ }
+ 
++/// QLinearMatMul operator.
++///
++/// This multiplies quantized matrices. The zero-point adjusted products
++/// `(a - a_zero_point) * (b - b_zero_point)` are accumulated in int32 and the
++/// result is requantized to the output type as
++/// `saturate(round_ties_even(acc * a_scale * b_scale / y_scale) + y_zero_point)`.
++///
++/// The activation and output scales and zero points must be per-tensor (scalar
++/// or single-element vectors). The weight scale and zero point must have
++/// matching granularity: either both per-tensor or both per-column, with one
++/// entry per column of `b`.
++///
++/// The output type is given by the type of the `y_zero_point` input, or
++/// defaults to u8 if it is omitted.
++///
++/// See <https://onnx.ai/onnx/operators/onnx__QLinearMatMul.html>.
++#[derive(Debug, Default)]
++pub struct QLinearMatMul {}
++
++impl QLinearMatMul {
++    fn run_typed<LhsT, RhsT>(
++        &self,
++        ctx: &OpRunContext,
++        a: TensorView<LhsT>,
++        a_zero_point: Option<TensorView<LhsT>>,
++        b: TensorView<RhsT>,
++        b_zero_point: Option<TensorView<RhsT>>,
++    ) -> Result<Value, OpError>
++    where
++        LhsT: Copy + Default + Into<i16> + ShiftCast<u8> + 'static,
++        RhsT: Copy + Default + ShiftCast<i8> + 'static,
++        for<'a> TensorView<'a, LhsT>: ShiftCast<CowTensor<'a, u8>>,
++        for<'a> TensorView<'a, RhsT>: ShiftCast<CowTensor<'a, i8>>,
++    {
++        let inputs = ctx.inputs();
++        let a_scale = per_tensor_scale(inputs.require_as(1)?)?;
++        let b_scale: TensorView<f32> = inputs.require_as(4)?;
++        let y_scale = per_tensor_scale(inputs.require_as(6)?)?;
++        let y_zero_point = inputs.get(7);
++
++        let b_cols = if b.ndim() > 1 {
++            b.size(b.ndim() - 1)
++        } else {
++            1
++        };
++        let b_scales = weight_quant_params(b_scale, b_zero_point.as_ref(), b_cols)?;
++        if let Some(zp) = a_zero_point.as_ref() {
++            per_tensor_zero_point(zp.view())?;
++        }
++
++        let packed_b = inputs
++            .get_prepacked(3)
++            .and_then(|packed| packed.try_into().ok());
++
++        let acc = matmul_integer(ctx.pool(), a, b, a_zero_point, b_zero_point, packed_b)?;
++
++        let combined_scales = match &b_scales {
++            ChannelScales::Scalar(b_scale) => ChannelScales::Scalar(a_scale * b_scale / y_scale),
++            ChannelScales::Vector(b_scales) => {
++                ChannelScales::Vector(b_scales.iter().map(|bs| a_scale * bs / y_scale).collect())
++            }
++        };
++
++        // Requantize the accumulator along the last (column) axis.
++        let channel_axis = acc.ndim().saturating_sub(1);
++        match y_zero_point {
++            Some(ValueView::UInt8Tensor(zp)) => {
++                let zp = per_tensor_zero_point(zp)?;
++                requantize_int32(ctx.pool(), acc, &combined_scales, channel_axis, zp)
++                    .map(Value::from)
++            }
++            Some(ValueView::Int8Tensor(zp)) => {
++                let zp = per_tensor_zero_point(zp)?;
++                requantize_int32(ctx.pool(), acc, &combined_scales, channel_axis, zp)
++                    .map(Value::from)
++            }
++            None => requantize_int32(ctx.pool(), acc, &combined_scales, channel_axis, 0u8)
++                .map(Value::from),
++            _ => Err(OpError::UnsupportedType),
++        }
++    }
++}
++
++impl Operator for QLinearMatMul {
++    fn name(&self) -> &str {
++        "QLinearMatMul"
++    }
++
++    fn max_inputs(&self) -> Option<usize> {
++        Some(8)
++    }
++
++    fn run(&self, ctx: &OpRunContext) -> Result<OutputList, OpError> {
++        let inputs = ctx.inputs();
++        let a = inputs.require(0)?;
++        let b = inputs.require(3)?;
++
++        macro_rules! qlinear_matmul {
++            ($a:expr, $a_ty:ty, $b:expr, $b_ty:ty) => {{
++                let a_zero_point: Option<TensorView<$a_ty>> = inputs.get_as(2)?;
++                let b_zero_point: Option<TensorView<$b_ty>> = inputs.get_as(5)?;
++                self.run_typed(ctx, $a, a_zero_point, $b, b_zero_point)
++            }};
++        }
++
++        let result = match (a, b) {
++            (ValueView::UInt8Tensor(a), ValueView::Int8Tensor(b)) => {
++                qlinear_matmul!(a, u8, b, i8)
++            }
++            (ValueView::UInt8Tensor(a), ValueView::UInt8Tensor(b)) => {
++                qlinear_matmul!(a, u8, b, u8)
++            }
++            (ValueView::Int8Tensor(a), ValueView::Int8Tensor(b)) => {
++                qlinear_matmul!(a, i8, b, i8)
++            }
++            (ValueView::Int8Tensor(a), ValueView::UInt8Tensor(b)) => {
++                qlinear_matmul!(a, i8, b, u8)
++            }
++            _ => Err(OpError::UnsupportedType),
++        };
++        result.into_op_result()
++    }
++
++    fn prepack_inputs(&self) -> SmallVec<[usize; 1]> {
++        [3].into()
++    }
++
++    fn prepack(&self, index: usize, input: ValueView) -> Option<PrepackedInput> {
++        if index == 3 {
++            matmul_prepack_b::<u8, i8, i32>(input)
++        } else {
++            None
++        }
++    }
++
++    fn output_types(&self, _ctx: &OutputTypesContext) -> Option<OutputTypeList> {
++        Some([OutputType::CopyFromInput(7)].into())
++    }
++
++    fn as_infer_shapes(&self) -> Option<&dyn InferShapes> {
++        Some(&shape_ops::QLinearMatMul)
++    }
++}
++
+ /// Scale factor applied to the integer output of a quantized operator when
+ /// converting it to float.
+ #[derive(Clone, Debug)]
+@@ -832,12 +984,14 @@ mod tests {
+ 
+     use crate::buffer_pool::AutoReturn;
+     use crate::buffer_pool::BufferPool;
+-    use crate::operator::{InputList, Operator, OutputMask};
++    use crate::operator::{InputList, Operator, OperatorExt, OutputMask};
+     use crate::ops::binary_elementwise::broadcast_shapes;
++    use crate::ops::quantize::{ChannelScales, requantize_int32};
++    use crate::value::ValueView;
+ 
+     use super::{
+         FusedMatMul, MatMul, MatMulInteger, MatmulStrategy, OpError, OpRunContext, OutputScale,
+-        cast_scale, gemm, matmul, matmul_fused, matmul_impl, matmul_integer,
++        QLinearMatMul, cast_scale, gemm, matmul, matmul_fused, matmul_impl, matmul_integer,
+     };
+ 
+     fn gemm_tensors(c: &mut Tensor, a: &Tensor, b: &Tensor, alpha: f32, beta: f32) {
+@@ -1750,6 +1904,458 @@ mod tests {
+     impl_matmul_integer_test!(test_matmul_integer_i8_u8, i8, u8);
+     impl_matmul_integer_test!(test_matmul_integer_i8_i8, i8, i8);
+ 
++    macro_rules! impl_qlinear_matmul_test {
++        ($name:ident, $lhs_ty:ty, $rhs_ty:ty, $out_ty:ty) => {
++            #[test]
++            fn $name() {
++                // See `impl_matmul_integer_test` for why the LHS uses a
++                // reduced range.
++                let mut a_rng = ReducedRangeRng::new(true /* reduce_range */, 1234);
++                let mut b_rng = XorShiftRng::new(5678);
++                let pool = BufferPool::new();
++                let op = QLinearMatMul {};
++
++                let a_scale_val = 0.1f32;
++                let b_scale_val = 0.02f32;
++                let y_scale_val = 0.15f32;
++                let a_zp_val: $lhs_ty = 2;
++                let b_zp_val: $rhs_ty = 3;
++                let y_zp_val: $out_ty = 7;
++
++                #[derive(Debug)]
++                struct Case {
++                    a: Tensor<$lhs_ty>,
++                    b: Tensor<$rhs_ty>,
++                }
++
++                let cases = [
++                    // Matrix x matrix.
++                    Case {
++                        a: Tensor::rand(&[3, 4], &mut a_rng),
++                        b: Tensor::rand(&[4, 5], &mut b_rng),
++                    },
++                    // Batched LHS.
++                    Case {
++                        a: Tensor::rand(&[2, 3, 4], &mut a_rng),
++                        b: Tensor::rand(&[4, 5], &mut b_rng),
++                    },
++                    // Vector LHS.
++                    Case {
++                        a: Tensor::rand(&[4], &mut a_rng),
++                        b: Tensor::rand(&[4, 5], &mut b_rng),
++                    },
++                    // Vector RHS.
++                    Case {
++                        a: Tensor::rand(&[3, 4], &mut a_rng),
++                        b: Tensor::rand(&[4], &mut b_rng),
++                    },
++                ];
++
++                cases.test_each(|case| {
++                    let a_scale = Tensor::from(a_scale_val);
++                    let a_zp = Tensor::from(a_zp_val);
++                    let b_scale = Tensor::from(b_scale_val);
++                    let b_zp = Tensor::from(b_zp_val);
++                    let y_scale = Tensor::from(y_scale_val);
++                    let y_zp = Tensor::from(y_zp_val);
++
++                    let inputs: [Option<ValueView>; 8] = [
++                        Some(case.a.view().into()),
++                        Some(a_scale.view().into()),
++                        Some(a_zp.view().into()),
++                        Some(case.b.view().into()),
++                        Some(b_scale.view().into()),
++                        Some(b_zp.view().into()),
++                        Some(y_scale.view().into()),
++                        Some(y_zp.view().into()),
++                    ];
++                    let result: Tensor<$out_ty> = op
++                        .run_simple(InputList::from_optional(&inputs))
++                        .expect("QLinearMatMul failed");
++
++                    let acc = reference_matmul_integer(
++                        case.a.view(),
++                        case.b.view(),
++                        Some(a_zp.view()),
++                        Some(b_zp.view()),
++                    );
++                    let combined = ChannelScales::Scalar(a_scale_val * b_scale_val / y_scale_val);
++                    let channel_axis = acc.ndim().saturating_sub(1);
++                    let expected: Tensor<$out_ty> =
++                        requantize_int32(&pool, acc, &combined, channel_axis, y_zp_val).unwrap();
++                    assert_eq!(result, expected);
++                });
++            }
++        };
++    }
++
++    // Test combinations of LHS, RHS and output signed-ness.
++    impl_qlinear_matmul_test!(test_qlinear_matmul_u8_i8_u8, u8, i8, u8);
++    impl_qlinear_matmul_test!(test_qlinear_matmul_u8_u8_u8, u8, u8, u8);
++    impl_qlinear_matmul_test!(test_qlinear_matmul_i8_i8_u8, i8, i8, u8);
++    impl_qlinear_matmul_test!(test_qlinear_matmul_i8_u8_u8, i8, u8, u8);
++    impl_qlinear_matmul_test!(test_qlinear_matmul_u8_i8_i8, u8, i8, i8);
++
++    #[test]
++    fn test_qlinear_matmul_single_element_vector_params() {
++        // Scales and zero points for activations and outputs may be either
++        // scalars or single-element vectors.
++        let pool = BufferPool::new();
++        let mut a_rng = ReducedRangeRng::new(true /* reduce_range */, 1234);
++        let mut b_rng = XorShiftRng::new(5678);
++        let op = QLinearMatMul {};
++
++        let a = Tensor::rand(&[3, 4], &mut a_rng);
++        let b = Tensor::rand(&[4, 5], &mut b_rng);
++        let a_scale = Tensor::from([0.1f32]);
++        let a_zp = Tensor::from([2u8]);
++        let b_scale = Tensor::from([0.02f32]);
++        let b_zp = Tensor::from([3i8]);
++        let y_scale = Tensor::from([0.15f32]);
++        let y_zp = Tensor::from([7u8]);
++
++        let inputs: [Option<ValueView>; 8] = [
++            Some(a.view().into()),
++            Some(a_scale.view().into()),
++            Some(a_zp.view().into()),
++            Some(b.view().into()),
++            Some(b_scale.view().into()),
++            Some(b_zp.view().into()),
++            Some(y_scale.view().into()),
++            Some(y_zp.view().into()),
++        ];
++        let result: Tensor<u8> = op
++            .run_simple(InputList::from_optional(&inputs))
++            .expect("QLinearMatMul failed");
++
++        let acc = reference_matmul_integer(
++            a.view(),
++            b.view(),
++            Some(Tensor::from(2u8).view()),
++            Some(Tensor::from(3i8).view()),
++        );
++        let combined = ChannelScales::Scalar(0.1 * 0.02 / 0.15);
++        let channel_axis = acc.ndim().saturating_sub(1);
++        let expected: Tensor<u8> =
++            requantize_int32(&pool, acc, &combined, channel_axis, 7).unwrap();
++        assert_eq!(result, expected);
++    }
++
++    #[test]
++    fn test_qlinear_matmul_per_channel_weights() {
++        let pool = BufferPool::new();
++        let mut a_rng = ReducedRangeRng::new(true /* reduce_range */, 1234);
++        let mut b_rng = XorShiftRng::new(5678);
++        let op = QLinearMatMul {};
++
++        let a = Tensor::<u8>::rand(&[3, 4], &mut a_rng);
++        let b = Tensor::<i8>::rand(&[4, 5], &mut b_rng);
++        let b_cols = b.size(1);
++
++        let a_scale_val = 0.1f32;
++        let y_scale_val = 0.15f32;
++        let (a_zp_val, y_zp_val) = (2u8, 7u8);
++        let b_scales: Vec<f32> = (0..b_cols).map(|c| 0.01 + 0.005 * c as f32).collect();
++        let b_zps: Vec<i8> = (0..b_cols).map(|c| c as i8 - 2).collect();
++
++        let a_scale = Tensor::from(a_scale_val);
++        let a_zp = Tensor::from(a_zp_val);
++        let b_scale = Tensor::from_data(&[b_cols], b_scales.clone());
++        let b_zp = Tensor::from_data(&[b_cols], b_zps.clone());
++        let y_scale = Tensor::from(y_scale_val);
++        let y_zp = Tensor::from(y_zp_val);
++
++        let inputs: [Option<ValueView>; 8] = [
++            Some(a.view().into()),
++            Some(a_scale.view().into()),
++            Some(a_zp.view().into()),
++            Some(b.view().into()),
++            Some(b_scale.view().into()),
++            Some(b_zp.view().into()),
++            Some(y_scale.view().into()),
++            Some(y_zp.view().into()),
++        ];
++        let result: Tensor<u8> = op
++            .run_simple(InputList::from_optional(&inputs))
++            .expect("QLinearMatMul failed");
++
++        let acc =
++            reference_matmul_integer(a.view(), b.view(), Some(a_zp.view()), Some(b_zp.view()));
++        let combined = ChannelScales::Vector(
++            b_scales
++                .iter()
++                .map(|bs| a_scale_val * bs / y_scale_val)
++                .collect(),
++        );
++        let expected: Tensor<u8> = requantize_int32(&pool, acc, &combined, 1, y_zp_val).unwrap();
++        assert_eq!(result, expected);
++    }
++
++    #[test]
++    fn test_qlinear_matmul_no_zero_points() {
++        let pool = BufferPool::new();
++        let mut a_rng = ReducedRangeRng::new(true /* reduce_range */, 1234);
++        let mut b_rng = XorShiftRng::new(5678);
++        let op = QLinearMatMul {};
++
++        let a = Tensor::<u8>::rand(&[3, 4], &mut a_rng);
++        let b = Tensor::<i8>::rand(&[4, 5], &mut b_rng);
++
++        let a_scale_val = 0.1f32;
++        let b_scale_val = 0.02f32;
++        let y_scale_val = 0.15f32;
++
++        let a_scale = Tensor::from(a_scale_val);
++        let b_scale = Tensor::from(b_scale_val);
++        let y_scale = Tensor::from(y_scale_val);
++
++        // Omit the activation, weight and output zero points. The output type
++        // then defaults to u8 with a zero point of zero.
++        let inputs: [Option<ValueView>; 8] = [
++            Some(a.view().into()),
++            Some(a_scale.view().into()),
++            None,
++            Some(b.view().into()),
++            Some(b_scale.view().into()),
++            None,
++            Some(y_scale.view().into()),
++            None,
++        ];
++        let result: Tensor<u8> = op
++            .run_simple(InputList::from_optional(&inputs))
++            .expect("QLinearMatMul failed");
++
++        let acc = reference_matmul_integer(a.view(), b.view(), None, None);
++        let combined = ChannelScales::Scalar(a_scale_val * b_scale_val / y_scale_val);
++        let expected: Tensor<u8> = requantize_int32(&pool, acc, &combined, 1, 0u8).unwrap();
++        assert_eq!(result, expected);
++    }
++
++    #[test]
++    fn test_qlinear_matmul_with_prepacked_inputs() -> Result<(), Box<dyn Error>> {
++        let mut a_rng = ReducedRangeRng::new(true /* reduce_range */, 1234);
++        let mut b_rng = XorShiftRng::new(5678);
++        let op = QLinearMatMul {};
++
++        let a = Tensor::<u8>::rand(&[5, 10], &mut a_rng);
++
++        // The unpacked and pre-packed versions of an input should use the
++        // same data. Here we intentionally use different tensors with
++        // the same shape so we can verify if the packed data was used.
++        let b = Tensor::<i8>::rand(&[10, 3], &mut b_rng);
++        let packed_b_input = Tensor::<i8>::rand(&[10, 3], &mut b_rng);
++        let packed_b = op.prepack(3, packed_b_input.view().into()).unwrap();
++
++        let a_scale_val = 0.1f32;
++        let b_scale_val = 0.02f32;
++        let y_scale_val = 0.15f32;
++
++        let a_scale = Tensor::from(a_scale_val);
++        let a_zp = Tensor::from(2u8);
++        let b_scale = Tensor::from(b_scale_val);
++        let b_zp = Tensor::from(0i8);
++        let y_scale = Tensor::from(y_scale_val);
++        let y_zp = Tensor::from(7u8);
++
++        let pool = BufferPool::new();
++        let get_prepacked = |idx| {
++            if idx == 3 { Some(&packed_b) } else { None }
++        };
++        let inputs = InputList::from(&[
++            a.view().into(),
++            a_scale.view().into(),
++            a_zp.view().into(),
++            b.view().into(),
++            b_scale.view().into(),
++            b_zp.view().into(),
++            y_scale.view().into(),
++            y_zp.view().into(),
++        ])
++        .with_prepacked(&get_prepacked);
++        let ctx = OpRunContext::new(&pool, &inputs, OutputMask::all_used(1));
++        let mut result = op.run(&ctx).unwrap();
++        let result: Tensor<u8> = result.remove(0).try_into().unwrap();
++
++        let acc = reference_matmul_integer(
++            a.view(),
++            packed_b_input.view(),
++            Some(a_zp.view()),
++            Some(b_zp.view()),
++        );
++        let combined = ChannelScales::Scalar(a_scale_val * b_scale_val / y_scale_val);
++        let expected: Tensor<u8> = requantize_int32(&pool, acc, &combined, 1, 7u8)?;
++        expect_equal(&result, &expected)?;
++
++        Ok(())
++    }
++
++    #[test]
++    fn test_qlinear_matmul_rounding_and_saturation() {
++        let op = QLinearMatMul {};
++
++        // Rounding. The accumulator values [50, 150] scaled by 0.05 give
++        // [2.5, 7.5] which round (ties to even) to [2, 8].
++        let a = Tensor::from([[50u8], [150]]);
++        let b = Tensor::from([[1i8]]);
++        let a_scale = Tensor::from(0.05f32);
++        let a_zp = Tensor::from(0u8);
++        let b_scale = Tensor::from(1f32);
++        let b_zp = Tensor::from(0i8);
++        let y_scale = Tensor::from(1f32);
++        let y_zp = Tensor::from(0u8);
++
++        let inputs: [Option<ValueView>; 8] = [
++            Some(a.view().into()),
++            Some(a_scale.view().into()),
++            Some(a_zp.view().into()),
++            Some(b.view().into()),
++            Some(b_scale.view().into()),
++            Some(b_zp.view().into()),
++            Some(y_scale.view().into()),
++            Some(y_zp.view().into()),
++        ];
++        let result: Tensor<u8> = op.run_simple(InputList::from_optional(&inputs)).unwrap();
++        assert_eq!(result, Tensor::from([[2u8], [8]]));
++
++        // Saturation. The accumulators 255 * 127 = 32385 and 255 * -128 =
++        // -32640 saturate to the i8 range [-128, 127].
++        let a = Tensor::from([[255u8]]);
++        let b = Tensor::from([[127i8, -128]]);
++        let a_scale = Tensor::from(1f32);
++        let a_zp = Tensor::from(0u8);
++        let b_scale = Tensor::from(1f32);
++        let b_zp = Tensor::from(0i8);
++        let y_scale = Tensor::from(1f32);
++        let y_zp = Tensor::from(0i8);
++
++        let inputs: [Option<ValueView>; 8] = [
++            Some(a.view().into()),
++            Some(a_scale.view().into()),
++            Some(a_zp.view().into()),
++            Some(b.view().into()),
++            Some(b_scale.view().into()),
++            Some(b_zp.view().into()),
++            Some(y_scale.view().into()),
++            Some(y_zp.view().into()),
++        ];
++        let result: Tensor<i8> = op.run_simple(InputList::from_optional(&inputs)).unwrap();
++        assert_eq!(result, Tensor::from([[127i8, -128]]));
++    }
++
++    #[test]
++    fn test_qlinear_matmul_errors() {
++        let op = QLinearMatMul {};
++        let a = Tensor::from([[10u8, 10], [10, 10]]);
++        let b = Tensor::from([[1i8, 1], [1, 1]]);
++
++        // Valid parameters for each quantization input. Individual cases
++        // override one of these.
++        let a_scale_ok = Tensor::from(0.1f32);
++        let a_zp_ok = Tensor::from(0u8);
++        let b_scale_ok = Tensor::from(0.1f32);
++        let b_zp_ok = Tensor::from(0i8);
++        let y_scale_ok = Tensor::from(0.1f32);
++        let y_zp_ok = Tensor::from(0u8);
++
++        let run = |params: &[Option<ValueView>; 6]| -> Result<Tensor<u8>, OpError> {
++            let inputs: [Option<ValueView>; 8] = [
++                Some(a.view().into()),
++                params[0].clone(),
++                params[1].clone(),
++                Some(b.view().into()),
++                params[2].clone(),
++                params[3].clone(),
++                params[4].clone(),
++                params[5].clone(),
++            ];
++            op.run_simple(InputList::from_optional(&inputs))
++        };
++
++        let ok_params: [Option<ValueView>; 6] = [
++            Some(a_scale_ok.view().into()),
++            Some(a_zp_ok.view().into()),
++            Some(b_scale_ok.view().into()),
++            Some(b_zp_ok.view().into()),
++            Some(y_scale_ok.view().into()),
++            Some(y_zp_ok.view().into()),
++        ];
++
++        // Valid case.
++        assert!(run(&ok_params).is_ok());
++
++        // Multi-element activation scale.
++        let a_scale = Tensor::from([0.1f32, 0.2]);
++        let mut params = ok_params.clone();
++        params[0] = Some(a_scale.view().into());
++        assert_eq!(
++            run(&params),
++            Err(OpError::unsupported_value(
++                "only per-tensor scales are supported for this input"
++            ))
++        );
++
++        // Multi-element (per-row) activation zero point.
++        let a_zp = Tensor::from([0u8, 1]);
++        let mut params = ok_params.clone();
++        params[1] = Some(a_zp.view().into());
++        assert_eq!(
++            run(&params),
++            Err(OpError::unsupported_value(
++                "only per-tensor zero points are supported for this input"
++            ))
++        );
++
++        // Per-tensor weight scale with per-column zero point.
++        let b_zp = Tensor::from([0i8, 0]);
++        let mut params = ok_params.clone();
++        params[3] = Some(b_zp.view().into());
++        assert_eq!(
++            run(&params),
++            Err(OpError::invalid_value(
++                "scale and zero point must have the same granularity"
++            ))
++        );
++
++        // Per-column weight scale with per-tensor zero point.
++        let b_scale = Tensor::from([0.1f32, 0.2]);
++        let mut params = ok_params.clone();
++        params[2] = Some(b_scale.view().into());
++        assert_eq!(
++            run(&params),
++            Err(OpError::invalid_value(
++                "scale and zero point must have the same granularity"
++            ))
++        );
++
++        // Weight scale length does not match column count.
++        let b_scale = Tensor::from([0.1f32, 0.2, 0.3]);
++        let b_zp = Tensor::from([0i8, 0, 0]);
++        let mut params = ok_params.clone();
++        params[2] = Some(b_scale.view().into());
++        params[3] = Some(b_zp.view().into());
++        assert_eq!(
++            run(&params),
++            Err(OpError::incompatible_input_shapes(
++                "scale length does not match channel count"
++            ))
++        );
++
++        // Zero output scale.
++        let y_scale = Tensor::from(0f32);
++        let mut params = ok_params.clone();
++        params[4] = Some(y_scale.view().into());
++        assert_eq!(
++            run(&params),
++            Err(OpError::invalid_value("scale must be positive and finite"))
++        );
++
++        // Output zero point with unsupported type.
++        let y_zp = Tensor::from(0f32);
++        let mut params = ok_params.clone();
++        params[5] = Some(y_zp.view().into());
++        assert_eq!(run(&params), Err(OpError::UnsupportedType));
++    }
++
+     #[test]
+     #[ignore]
+     fn bench_matmul() {
+diff --git a/src/ops/mod.rs b/src/ops/mod.rs
+index 294a7ea7a4431744cf17b98120f9fc683ac23ee9..7803d61928d3464d5afe81c94225911726b8ba98 100644
+--- a/src/ops/mod.rs
++++ b/src/ops/mod.rs
+@@ -77,7 +77,7 @@ pub(crate) use {
+     compute_shape::{ComputeShape, SymbolInfo},
+     concat::{Concat, Tile},
+     control_flow::{If, Loop},
+-    conv::{Conv, ConvInteger, ConvIntegerToFloat},
++    conv::{Conv, ConvInteger, ConvIntegerToFloat, QLinearConv},
+     conv_transpose::ConvTranspose,
+     convert::{BitCast, Cast, CastLike},
+     einsum::Einsum,
+@@ -87,7 +87,7 @@ pub(crate) use {
+     grid_sample::GridSample,
+     identity::Identity,
+     layout::{DepthToSpace, Expand, Flatten, Reshape, Shape, Size, Squeeze, Transpose, Unsqueeze},
+-    matmul::{FusedMatMul, Gemm, MatMul, MatMulInteger, MatMulIntegerToFloat},
++    matmul::{FusedMatMul, Gemm, MatMul, MatMulInteger, MatMulIntegerToFloat, QLinearMatMul},
+     non_max_suppression::NonMaxSuppression,
+     norm::{
+         BatchNormalization, InstanceNormalization, LayerNormalization, LogSoftmax, LpNormalization,
+@@ -262,7 +262,7 @@ fn try_resolve_index(size: usize, index: i32) -> Result<usize, OpError> {
+ /// dimension of a tensor with `ndim` dimensions.
+ ///
+ /// Negative axis values count backwards from the last dimension.
+-fn resolve_axis(ndim: usize, axis: isize) -> Result<usize, OpError> {
++pub(crate) fn resolve_axis(ndim: usize, axis: isize) -> Result<usize, OpError> {
+     resolve_index(ndim, axis).ok_or_else(|| {
+         OpError::invalid_value(format!(
+             "Axis {} is out of range. Must be in [{}, {})",
+diff --git a/src/ops/quantize.rs b/src/ops/quantize.rs
+index 32ff88c842c92989cc5738d0d804fec7e363bc5e..8c4e6f76d3e852b2b882c6c97df105f46546cda0 100644
+--- a/src/ops/quantize.rs
++++ b/src/ops/quantize.rs
+@@ -274,6 +274,143 @@ where
+     }
+ }
+ 
++/// Scales used when requantizing the int32 output of a quantized operator
++/// such as `QLinearConv` or `QLinearMatMul`.
++///
++/// Each scale combines the input, weight and output scales for the operator
++/// (`x_scale * w_scale / y_scale`).
++#[derive(Clone, Debug, PartialEq)]
++pub(crate) enum ChannelScales {
++    /// A single scale applied to all elements.
++    Scalar(f32),
++    /// One scale per channel along an axis of the output.
++    Vector(Vec<f32>),
++}
++
++/// Validate that a quantization scale is positive and finite.
++fn check_scale_value(scale: f32) -> Result<(), OpError> {
++    if !scale.is_finite() || scale <= 0. {
++        return Err(OpError::invalid_value("scale must be positive and finite"));
++    }
++    Ok(())
++}
++
++/// Extract a per-tensor quantization scale.
++///
++/// The scale must be a scalar or single-element vector. Multi-element scales
++/// are rejected since activation and output quantization for the QLinear
++/// operators must be per-tensor.
++pub(crate) fn per_tensor_scale(scale: TensorView<f32>) -> Result<f32, OpError> {
++    let Some(&scale) = scale.item() else {
++        return Err(OpError::unsupported_value(
++            "only per-tensor scales are supported for this input",
++        ));
++    };
++    check_scale_value(scale)?;
++    Ok(scale)
++}
++
++/// Extract a per-tensor zero point.
++///
++/// The zero point must be a scalar or single-element vector.
++pub(crate) fn per_tensor_zero_point<T: Copy>(zero_point: TensorView<T>) -> Result<T, OpError> {
++    zero_point.item().copied().ok_or(OpError::unsupported_value(
++        "only per-tensor zero points are supported for this input",
++    ))
++}
++
++/// Validate weight scale and zero point granularity and extract the scale(s).
++///
++/// The scale and zero point must either both be per-tensor (scalar or
++/// single-element) or both be per-channel (1-D vectors with `channels`
++/// elements). The zero point is only validated here; it should be passed
++/// through to the integer compute kernel.
++pub(crate) fn weight_quant_params<T>(
++    scale: TensorView<f32>,
++    zero_point: Option<&TensorView<T>>,
++    channels: usize,
++) -> Result<ChannelScales, OpError> {
++    if let Some(&scale) = scale.item() {
++        // Per-tensor scale.
++        if let Some(zp) = zero_point
++            && zp.item().is_none()
++        {
++            return Err(OpError::invalid_value(
++                "scale and zero point must have the same granularity",
++            ));
++        }
++        check_scale_value(scale)?;
++        Ok(ChannelScales::Scalar(scale))
++    } else if let Ok(scales) = scale.into_rank::<1>() {
++        // Per-channel scales.
++        check_eq!(
++            scales.size(0),
++            channels,
++            "scale length does not match channel count"
++        )?;
++        if let Some(zp) = zero_point
++            && (zp.ndim() != 1 || zp.size(0) != channels)
++        {
++            return Err(OpError::invalid_value(
++                "scale and zero point must have the same granularity",
++            ));
++        }
++        for &scale in scales.iter() {
++            check_scale_value(scale)?;
++        }
++        Ok(ChannelScales::Vector(scales.to_vec()))
++    } else {
++        Err(OpError::unsupported_value(
++            "scale must be a scalar or 1-D vector",
++        ))
++    }
++}
++
++/// Requantize an int32 accumulator tensor to the output type of a quantized
++/// operator.
++///
++/// Each output element is `saturate(round_ties_even(acc * scale) + zero_point)`.
++/// For per-channel scales, `channel_axis` specifies the axis along which the
++/// scales vary.
++pub(crate) fn requantize_int32<T>(
++    pool: &BufferPool,
++    acc: Tensor<i32>,
++    scales: &ChannelScales,
++    channel_axis: usize,
++    zero_point: T,
++) -> Result<Tensor<T>, OpError>
++where
++    T: Copy + Default + Send + Sync + Scalar + 'static,
++    f32: Quantize<T>,
++{
++    match scales {
++        ChannelScales::Scalar(scale) => {
++            Ok(acc.map_in(pool, |x| (*x as f32).quantize(*scale, zero_point)))
++        }
++        ChannelScales::Vector(scales) => {
++            check_eq!(
++                scales.len(),
++                acc.size(channel_axis),
++                "scale length does not match channel count"
++            )?;
++            let mut output = Tensor::uninit_in(pool, acc.shape());
++            output
++                .axis_iter_mut(channel_axis)
++                .into_par_iter()
++                .zip(acc.axis_iter(channel_axis))
++                .zip(scales.par_iter())
++                .for_each(|((mut out_slice, in_slice), &scale)| {
++                    for (y, &x) in out_slice.iter_mut().zip(in_slice.iter()) {
++                        y.write((x as f32).quantize(scale, zero_point));
++                    }
++                });
++
++            // Safety: All elements are initialized
++            Ok(unsafe { output.assume_init() })
++        }
++    }
++}
++
+ #[derive(Debug)]
+ pub struct QuantizeLinear {
+     pub axis: isize,
+@@ -487,7 +624,10 @@ mod tests {
+     use rten_tensor::test_util::expect_equal_with_tolerance;
+     use rten_testing::TestCases;
+ 
+-    use super::{dequantize_linear, dynamic_quantize_linear, quantize_linear};
++    use super::{
++        ChannelScales, dequantize_linear, dynamic_quantize_linear, per_tensor_scale,
++        per_tensor_zero_point, quantize_linear, requantize_int32, weight_quant_params,
++    };
+     use crate::buffer_pool::BufferPool;
+     use crate::operator::OpError;
+     use crate::value::Value;
+@@ -765,4 +905,225 @@ mod tests {
+             expect_equal_with_tolerance(&dequantized, &input, *max_error, *max_error).unwrap();
+         })
+     }
++
++    #[test]
++    fn test_per_tensor_scale() {
++        #[derive(Debug)]
++        struct Case {
++            scale: Tensor<f32>,
++            expected: Result<f32, OpError>,
++        }
++
++        let cases = [
++            // Scalar scale.
++            Case {
++                scale: Tensor::from(0.5),
++                expected: Ok(0.5),
++            },
++            // Single-element vector scale.
++            Case {
++                scale: Tensor::from([0.5]),
++                expected: Ok(0.5),
++            },
++            // Multi-element vector scale.
++            Case {
++                scale: Tensor::from([0.5, 1.]),
++                expected: Err(OpError::unsupported_value(
++                    "only per-tensor scales are supported for this input",
++                )),
++            },
++            // 2D scale.
++            Case {
++                scale: Tensor::from([[0.5, 1.]]),
++                expected: Err(OpError::unsupported_value(
++                    "only per-tensor scales are supported for this input",
++                )),
++            },
++            // Zero scale.
++            Case {
++                scale: Tensor::from(0.),
++                expected: Err(OpError::invalid_value("scale must be positive and finite")),
++            },
++            // Negative scale.
++            Case {
++                scale: Tensor::from(-0.5),
++                expected: Err(OpError::invalid_value("scale must be positive and finite")),
++            },
++            // Non-finite scales.
++            Case {
++                scale: Tensor::from(f32::NAN),
++                expected: Err(OpError::invalid_value("scale must be positive and finite")),
++            },
++            Case {
++                scale: Tensor::from(f32::INFINITY),
++                expected: Err(OpError::invalid_value("scale must be positive and finite")),
++            },
++        ];
++
++        cases.test_each(|case| {
++            assert_eq!(per_tensor_scale(case.scale.view()), case.expected);
++        })
++    }
++
++    #[test]
++    fn test_per_tensor_zero_point() {
++        // Scalar zero point.
++        assert_eq!(per_tensor_zero_point(Tensor::from(3u8).view()), Ok(3));
++        // Single-element vector zero point.
++        assert_eq!(per_tensor_zero_point(Tensor::from([3u8]).view()), Ok(3));
++        // Multi-element vector zero point.
++        assert_eq!(
++            per_tensor_zero_point(Tensor::from([3u8, 4]).view()),
++            Err(OpError::unsupported_value(
++                "only per-tensor zero points are supported for this input"
++            ))
++        );
++    }
++
++    #[test]
++    fn test_weight_quant_params() {
++        #[derive(Debug)]
++        struct Case {
++            scale: Tensor<f32>,
++            zero_point: Option<Tensor<i8>>,
++            channels: usize,
++            expected: Result<ChannelScales, OpError>,
++        }
++
++        let cases = [
++            // Per-tensor scale and zero point.
++            Case {
++                scale: Tensor::from(0.5),
++                zero_point: Some(Tensor::from(1)),
++                channels: 2,
++                expected: Ok(ChannelScales::Scalar(0.5)),
++            },
++            // Per-tensor scale with no zero point.
++            Case {
++                scale: Tensor::from(0.5),
++                zero_point: None,
++                channels: 2,
++                expected: Ok(ChannelScales::Scalar(0.5)),
++            },
++            // Single-element vector scale and zero point.
++            Case {
++                scale: Tensor::from([0.5]),
++                zero_point: Some(Tensor::from([1])),
++                channels: 2,
++                expected: Ok(ChannelScales::Scalar(0.5)),
++            },
++            // Per-channel scale and zero point.
++            Case {
++                scale: Tensor::from([0.5, 1.]),
++                zero_point: Some(Tensor::from([1, 2])),
++                channels: 2,
++                expected: Ok(ChannelScales::Vector(vec![0.5, 1.])),
++            },
++            // Per-channel scale with no zero point.
++            Case {
++                scale: Tensor::from([0.5, 1.]),
++                zero_point: None,
++                channels: 2,
++                expected: Ok(ChannelScales::Vector(vec![0.5, 1.])),
++            },
++            // Per-tensor scale with per-channel zero point.
++            Case {
++                scale: Tensor::from(0.5),
++                zero_point: Some(Tensor::from([1, 2])),
++                channels: 2,
++                expected: Err(OpError::invalid_value(
++                    "scale and zero point must have the same granularity",
++                )),
++            },
++            // Per-channel scale with per-tensor zero point.
++            Case {
++                scale: Tensor::from([0.5, 1.]),
++                zero_point: Some(Tensor::from(1)),
++                channels: 2,
++                expected: Err(OpError::invalid_value(
++                    "scale and zero point must have the same granularity",
++                )),
++            },
++            // Scale length does not match channel count.
++            Case {
++                scale: Tensor::from([0.5, 1., 2.]),
++                zero_point: None,
++                channels: 2,
++                expected: Err(OpError::incompatible_input_shapes(
++                    "scale length does not match channel count",
++                )),
++            },
++            // Non-positive scale in per-channel scales.
++            Case {
++                scale: Tensor::from([0.5, 0.]),
++                zero_point: None,
++                channels: 2,
++                expected: Err(OpError::invalid_value("scale must be positive and finite")),
++            },
++            // 2D scale.
++            Case {
++                scale: Tensor::from([[0.5, 1.]]),
++                zero_point: None,
++                channels: 2,
++                expected: Err(OpError::unsupported_value(
++                    "scale must be a scalar or 1-D vector",
++                )),
++            },
++        ];
++
++        cases.test_each(|case| {
++            let result = weight_quant_params(
++                case.scale.view(),
++                case.zero_point.as_ref().map(|zp| zp.view()).as_ref(),
++                case.channels,
++            );
++            assert_eq!(result, case.expected);
++        })
++    }
++
++    #[test]
++    fn test_requantize_int32() {
++        let pool = BufferPool::new();
++
++        // Per-tensor scale. Values exercise rounding (ties to even) and
++        // saturation.
++        let acc = Tensor::from([2, 3, 5, -5, 1000, -1000]);
++        let result: Tensor<u8> =
++            requantize_int32(&pool, acc, &ChannelScales::Scalar(0.5), 0, 0u8).unwrap();
++        assert_eq!(result, Tensor::from([1, 2, 2, 0, 255, 0]));
++
++        // Per-tensor scale with i8 output and non-zero zero point.
++        let acc = Tensor::from([2, 3, 1000, -1000]);
++        let result: Tensor<i8> =
++            requantize_int32(&pool, acc, &ChannelScales::Scalar(0.5), 0, 1i8).unwrap();
++        assert_eq!(result, Tensor::from([2, 3, 127, -128]));
++
++        // Per-channel scales along axis 0.
++        let acc = Tensor::from([[2, 4], [6, 8]]);
++        let result: Tensor<i8> =
++            requantize_int32(&pool, acc, &ChannelScales::Vector(vec![0.5, 0.25]), 0, 0i8).unwrap();
++        assert_eq!(result, Tensor::from([[1, 2], [2, 2]]));
++
++        // Per-channel scales along axis 1.
++        let acc = Tensor::from([[2, 4], [6, 8]]);
++        let result: Tensor<i8> =
++            requantize_int32(&pool, acc, &ChannelScales::Vector(vec![0.5, 0.25]), 1, 0i8).unwrap();
++        assert_eq!(result, Tensor::from([[1, 1], [3, 2]]));
++
++        // Scale length does not match channel count.
++        let acc = Tensor::from([[2, 4], [6, 8]]);
++        let result: Result<Tensor<i8>, _> = requantize_int32(
++            &pool,
++            acc,
++            &ChannelScales::Vector(vec![0.5, 0.25, 0.5]),
++            0,
++            0i8,
++        );
++        assert_eq!(
++            result.err(),
++            Some(OpError::incompatible_input_shapes(
++                "scale length does not match channel count"
++            ))
++        );
++    }
+ }
+diff --git a/src/optimize.rs b/src/optimize.rs
+index 9127032acd30384fba0cc427875b54c8b2d32652..0a1e4a9b6a3c69207ffa0d211b6de3a858fd1715 100644
+--- a/src/optimize.rs
++++ b/src/optimize.rs
+@@ -30,9 +30,9 @@ use fusions::{
+     ComputeShapeFusion, ConvAddFusion, ConvBatchNormFusion, ConvIntegerToFloatFusion, Fusion,
+     FusionError, FusionVisitor, GeluFusion, GroupedQueryAttentionMatMulFusion, IdentityFusion,
+     LayerNormalizationFusion, MatMulAddFusion, MatMulIntegerToFloatFusion, MatMulScaleFusion,
+-    PatternFusion, RMSNormalizationFusion, ReciprocalFusion, ReduceMeanAxesFusion,
+-    RepeatInterleaveFusion, SafeSoftmaxFusion, ShapeSliceToConstant, SiluFusion, SwishFusion,
+-    TransposeFusion,
++    PatternFusion, QLinearConvFusion, QLinearMatMulFusion, RMSNormalizationFusion,
++    ReciprocalFusion, ReduceMeanAxesFusion, RepeatInterleaveFusion, SafeSoftmaxFusion,
++    ShapeSliceToConstant, SiluFusion, SwishFusion, TransposeFusion,
+ };
+ 
+ /// Errors that occur while applying graph optimizations.
+@@ -610,6 +610,15 @@ impl GraphOptimizer {
+         // will remove the ComputeShape node and downstream nodes.
+         early_fusions.push(ComputeShapeFusion {});
+ 
++        // Fusions of QDQ patterns into Q operators. These must run before
++        // constant propagation, otherwise constant prop will fold the
++        // `DequantizeLinear` of constant weights into a float constant first
++        // and the pattern will no longer match.
++        for with_bias in [false, true] {
++            early_fusions.push(QLinearConvFusion { with_bias }.into_visitor());
++        }
++        early_fusions.push(QLinearMatMulFusion {}.into_visitor());
++
+         self.apply_fusions(&mut graph_mut, early_fusions.visitors(), &diag)?;
+ 
+         // Constant propagation.
+diff --git a/src/optimize/fusions.rs b/src/optimize/fusions.rs
+index e2fb684468759c374f695c03870bdf2aac257928..372134d18cd3e3af03b56fe4878c27e878a781bf 100644
+--- a/src/optimize/fusions.rs
++++ b/src/optimize/fusions.rs
+@@ -15,12 +15,12 @@ use crate::operator::Operator;
+ use crate::ops::transform_inputs::TransformInputsBuilder;
+ use crate::ops::{
+     AddSoftmax, BatchNormalization, Cast, ComputeShape, Conv, ConvInteger, ConvIntegerToFloat,
+-    FusedMatMul, Gelu, GroupedQueryAttentionMatMul, LayerNormalization, MatMulIntegerToFloat,
+-    RMSNormalization, Reciprocal, ReduceMean, RepeatInterleave, Shape, Silu, Softmax, Swish,
+-    SymbolInfo, Transpose,
++    DequantizeLinear, FusedMatMul, Gelu, GroupedQueryAttentionMatMul, LayerNormalization,
++    MatMulIntegerToFloat, QLinearConv, QLinearMatMul, QuantizeLinear, RMSNormalization, Reciprocal,
++    ReduceMean, RepeatInterleave, Shape, Silu, Softmax, Swish, SymbolInfo, Transpose, resolve_axis,
+ };
+ use crate::optimize::pattern_matcher::{Match, Pattern};
+-use crate::value::ValueType;
++use crate::value::{DataType, ValueType};
+ 
+ #[derive(Debug)]
+ pub struct FusedOp {
+@@ -203,6 +203,10 @@ pub trait PatternFusion {
+         &[]
+     }
+ 
++    fn extra_constant(&self, _: &Match, _: &Graph) -> Result<Option<Constant>, FusionError> {
++        Ok(None)
++    }
++
+     /// Create a fused operator given a successful match for the pattern.
+     ///
+     /// This can fail if there are additional requirements which cannot be
+@@ -277,13 +281,19 @@ impl<PF: PatternFusion + 'static> FusionVisitor for PatternFusionVisitor<PF> {
+             .map(|name| pat_match.node_id(name))
+             .collect();
+         let fused_op = self.fusion.maybe_fuse(&pat_match, graph)?;
+-        let fusion = Fusion::from_op(
++        let mut fusion = Fusion::from_op(
+             op_node.name(),
+             Arc::new(fused_op),
+             &input_ids,
+             op_node.output_ids(),
+             &unused_input_ids,
+         );
++        if let Some(value) = self.fusion.extra_constant(&pat_match, graph)?
++            && let Fusion::Op(op) = &mut fusion
++        {
++            op.new_constant_inputs.push((op.input_ids.len(), value));
++            op.input_ids.push(None);
++        }
+         Ok(fusion)
+     }
+ }
+@@ -1058,6 +1068,369 @@ impl PatternFusion for ConvIntegerToFloatFusion {
+     }
+ }
+ 
++/// Granularity of a constant quantization parameter in a QDQ pattern.
++#[derive(Clone, Copy, PartialEq)]
++enum QuantParamKind {
++    /// Scalar or single-element vector.
++    PerTensor,
++    /// 1-D vector with more than one element.
++    PerChannel,
++    /// Any other shape, or a non-constant / unknown shape.
++    Unsupported,
++}
++
++/// Classify a constant quantization parameter by its shape.
++fn quant_param_kind(graph: &Graph, node_id: NodeId) -> QuantParamKind {
++    let Some(shape) = graph.get_node(node_id).and_then(|node| node.shape()) else {
++        return QuantParamKind::Unsupported;
++    };
++    match shape.as_ref() {
++        [] | [Dimension::Fixed(1)] => QuantParamKind::PerTensor,
++        [Dimension::Fixed(_)] => QuantParamKind::PerChannel,
++        _ => QuantParamKind::Unsupported,
++    }
++}
++
++/// Get the element type of a constant quantization parameter.
++fn quant_param_dtype(graph: &Graph, node_id: NodeId) -> Option<DataType> {
++    match graph.get_node(node_id)?.dtype()? {
++        ValueType::Tensor(dtype) => Some(dtype),
++        _ => None,
++    }
++}
++
++/// Extract the value of a per-tensor scale constant, which can be a scalar or
++/// single-element vector.
++fn get_per_tensor_scale(graph: &Graph, node_id: NodeId) -> Option<f32> {
++    if let Some(scale) = graph.get_scalar::<f32>(node_id) {
++        Some(scale)
++    } else {
++        graph
++            .get_vector::<f32>(node_id)
++            .filter(|vec| vec.len() == 1)
++            .map(|vec| vec[0])
++    }
++}
++
++/// Validate that a scale constant is per-tensor, positive and finite.
++fn check_per_tensor_scale(graph: &Graph, node_id: NodeId) -> Result<(), FusionError> {
++    match get_per_tensor_scale(graph, node_id) {
++        Some(scale) if scale.is_finite() && scale > 0. => Ok(()),
++        _ => Err(FusionError::CheckFailed(
++            "scale must be a positive and finite per-tensor value",
++        )),
++    }
++}
++
++/// Validate that a zero point constant has type u8 or i8, matching
++/// `expected_dtype` if that is known.
++fn check_zero_point_dtype(
++    graph: &Graph,
++    node_id: NodeId,
++    expected_dtype: Option<DataType>,
++) -> Result<(), FusionError> {
++    let Some(dtype) = quant_param_dtype(graph, node_id) else {
++        return Err(FusionError::CheckFailed("unknown zero point type"));
++    };
++    if !matches!(dtype, DataType::UInt8 | DataType::Int8) {
++        return Err(FusionError::CheckFailed("zero point must be u8 or i8"));
++    }
++    if let Some(expected) = expected_dtype
++        && dtype != expected
++    {
++        return Err(FusionError::CheckFailed(
++            "zero point type does not match data type",
++        ));
++    }
++    Ok(())
++}
++
++/// The axis along which per-channel weight quantization applies for an
++/// operator produced by a QDQ fusion.
++enum WeightQuantAxis {
++    /// Conv weights (OCHW layout): the output channel axis is 0.
++    ConvOutChannels,
++    /// MatMul RHS (K x N layout): the output channel axis is the last axis.
++    MatMulColumns,
++}
++
++/// Check that the constant quantization parameters in a matched
++/// `QuantizeLinear(Op(DequantizeLinear, DequantizeLinear))` pattern are
++/// supported by the QLinearConv / QLinearMatMul operators.
++fn check_qlinear_params(
++    graph: &Graph,
++    pat_match: &Match,
++    weight_axis: WeightQuantAxis,
++    weight_dq_axis: isize,
++) -> Result<(), FusionError> {
++    let x_scale = pat_match.node_id("x_scale").unwrap();
++    let x_zero = pat_match.node_id("x_zero").unwrap();
++    let w = pat_match.node_id("w").unwrap();
++    let w_scale = pat_match.node_id("w_scale").unwrap();
++    let w_zero = pat_match.node_id("w_zero").unwrap();
++    let y_scale = pat_match.node_id("y_scale").unwrap();
++    let y_zero = pat_match.node_id("y_zero").unwrap();
++
++    let data_dtype = |name: &str| {
++        let id = pat_match.node_id(name)?;
++        match graph.get_node(id)?.dtype()? {
++            ValueType::Tensor(dtype) => Some(dtype),
++            _ => None,
++        }
++    };
++    let x_dtype = data_dtype("x");
++    let w_dtype = data_dtype("w");
++
++    // Activation scale and zero point must be per-tensor.
++    check_per_tensor_scale(graph, x_scale)?;
++    if quant_param_kind(graph, x_zero) != QuantParamKind::PerTensor {
++        return Err(FusionError::CheckFailed(
++            "activation zero point must be a per-tensor value",
++        ));
++    }
++    check_zero_point_dtype(graph, x_zero, x_dtype)?;
++
++    // Output scale and zero point must be per-tensor.
++    check_per_tensor_scale(graph, y_scale)?;
++    if quant_param_kind(graph, y_zero) != QuantParamKind::PerTensor {
++        return Err(FusionError::CheckFailed(
++            "output zero point must be a per-tensor value",
++        ));
++    }
++    check_zero_point_dtype(graph, y_zero, None)?;
++
++    // Weight scale and zero point must both be per-tensor or both per-channel.
++    match (
++        quant_param_kind(graph, w_scale),
++        quant_param_kind(graph, w_zero),
++    ) {
++        (QuantParamKind::PerTensor, QuantParamKind::PerTensor) => {
++            check_per_tensor_scale(graph, w_scale)?;
++            check_zero_point_dtype(graph, w_zero, w_dtype)?;
++        }
++        (QuantParamKind::PerChannel, QuantParamKind::PerChannel) => {
++            // The quantization axis of the weight DequantizeLinear must match
++            // the operator's output channel axis.
++            let Some(w_rank) = graph.get_rank(w) else {
++                return Err(FusionError::CheckFailed("unknown weight rank"));
++            };
++            let Ok(axis) = resolve_axis(w_rank, weight_dq_axis) else {
++                return Err(FusionError::CheckFailed("invalid weight quantization axis"));
++            };
++            let expected_axis = match weight_axis {
++                WeightQuantAxis::ConvOutChannels => 0,
++                WeightQuantAxis::MatMulColumns if w_rank < 2 => {
++                    return Err(FusionError::CheckFailed(
++                        "per-column weight parameters require a matrix",
++                    ));
++                }
++                WeightQuantAxis::MatMulColumns => w_rank - 1,
++            };
++            if axis != expected_axis {
++                return Err(FusionError::CheckFailed(
++                    "weight quantization axis does not match output channel axis",
++                ));
++            }
++
++            let Some(scales) = graph.get_vector::<f32>(w_scale) else {
++                return Err(FusionError::CheckFailed("weight scale must be f32"));
++            };
++            if !scales.iter().all(|s| s.is_finite() && *s > 0.) {
++                return Err(FusionError::CheckFailed(
++                    "weight scales must be positive and finite",
++                ));
++            }
++            check_zero_point_dtype(graph, w_zero, w_dtype)?;
++        }
++        _ => {
++            return Err(FusionError::CheckFailed(
++                "weight scale and zero point must have the same granularity",
++            ));
++        }
++    }
++
++    Ok(())
++}
++
++/// If the matched QuantizeLinear has an explicit output dtype, check that it
++/// matches the output zero point type, since the fused operator determines
++/// the output type from the zero point.
++fn check_quantize_output_dtype(graph: &Graph, pat_match: &Match) -> Result<(), FusionError> {
++    let q_id = pat_match.node_id("q").unwrap();
++    let y_zero = pat_match.node_id("y_zero").unwrap();
++    if let Some(q) = graph.get_operator::<QuantizeLinear>(q_id)
++        && let Some(dtype) = q.output_dtype
++        && quant_param_dtype(graph, y_zero) != Some(dtype)
++    {
++        return Err(FusionError::CheckFailed(
++            "output dtype does not match zero point type",
++        ));
++    }
++    Ok(())
++}
++
++/// Pattern for `QuantizeLinear(Op(DQ(x, x_scale, x_zp), DQ(w, w_scale, w_zp)), y_scale, y_zp)`.
++///
++/// The scale and zero point inputs must all be constants. Patterns with
++/// missing optional zero point inputs (2-input DequantizeLinear or
++/// QuantizeLinear) or dynamic scale / zero point values do not match.
++fn qdq_compute_pattern(op_name: &'static str, op_key: &'static str, bias: bool) -> Pattern {
++    let x = Pattern::symbol("x");
++    let x_scale = Pattern::const_symbol("x_scale");
++    let x_zero = Pattern::const_symbol("x_zero");
++    let w = Pattern::symbol("w");
++    let w_scale = Pattern::const_symbol("w_scale");
++    let w_zero = Pattern::const_symbol("w_zero");
++    let y_scale = Pattern::const_symbol("y_scale");
++    let y_zero = Pattern::const_symbol("y_zero");
++
++    let mut args = vec![
++        Pattern::operator("DequantizeLinear", [x, x_scale, x_zero]),
++        Pattern::operator("DequantizeLinear", [w, w_scale, w_zero]).with_name("w_dq"),
++    ];
++    if bias {
++        args.push(Pattern::const_symbol("float_bias"));
++    }
++    Pattern::operator(
++        "QuantizeLinear",
++        [
++            Pattern::operator(op_name, args).with_name(op_key),
++            y_scale,
++            y_zero,
++        ],
++    )
++    .with_name("q")
++}
++
++/// Inputs of the QDQ compute pattern, in the order expected by the fused
++/// operator.
++const QDQ_PATTERN_INPUTS: &[&str] = &[
++    "x", "x_scale", "x_zero", "w", "w_scale", "w_zero", "y_scale", "y_zero",
++];
++
++/// Fuses `QuantizeLinear(Conv(DequantizeLinear(x), DequantizeLinear(w)))` into
++/// a `QLinearConv` operator.
++pub struct QLinearConvFusion {
++    pub with_bias: bool,
++}
++
++impl PatternFusion for QLinearConvFusion {
++    type Operator = QLinearConv;
++
++    fn name(&self) -> &str {
++        "QLinearConvFusion"
++    }
++
++    fn pattern(&self) -> Pattern {
++        qdq_compute_pattern("Conv", "conv", self.with_bias)
++    }
++
++    fn inputs(&self) -> &[&str] {
++        QDQ_PATTERN_INPUTS
++    }
++
++    fn unused_inputs(&self) -> &[&str] {
++        if self.with_bias { &["float_bias"] } else { &[] }
++    }
++
++    fn extra_constant(&self, m: &Match, g: &Graph) -> Result<Option<Constant>, FusionError> {
++        if !self.with_bias {
++            return Ok(None);
++        }
++        let err =
++            || FusionError::CheckFailed("bias must be exactly representable at accumulator scale");
++        let biases = g
++            .get_vector::<f32>(m.node_id("float_bias").unwrap())
++            .ok_or_else(err)?;
++        let scales = |name| {
++            let id = m.node_id(name).unwrap();
++            g.get_scalar::<f32>(id)
++                .map(|x| vec![x])
++                .or_else(|| g.get_vector::<f32>(id).map(|s| s.to_vec()))
++                .ok_or_else(err)
++        };
++        let xs = scales("x_scale")?;
++        let ws = scales("w_scale")?;
++        if xs.len() != 1 || !(ws.len() == 1 || ws.len() == biases.len()) {
++            return Err(err());
++        }
++        let mut codes = Vec::with_capacity(biases.len());
++        for (i, &b) in biases.iter().enumerate() {
++            let q = f64::from(b) / (f64::from(xs[0]) * f64::from(ws[i % ws.len()]));
++            if q.fract() != 0. || !(f64::from(i32::MIN)..=f64::from(i32::MAX)).contains(&q) {
++                return Err(err());
++            }
++            codes.push(q as i32);
++        }
++        Ok(Some(
++            ConstantNode::new(
++                None,
++                ConstantNodeData::Arc(ArcTensor::from_data(&[codes.len()], Arc::new(codes))),
++            )
++            .into(),
++        ))
++    }
++
++    fn maybe_fuse(&self, pat_match: &Match, graph: &Graph) -> Result<Self::Operator, FusionError> {
++        let conv: &Conv = graph
++            .get_operator(pat_match.node_id("conv").unwrap())
++            .ok_or(FusionError::CheckFailed("expected Conv operator"))?;
++        let w_dq: &DequantizeLinear = graph
++            .get_operator(pat_match.node_id("w_dq").unwrap())
++            .ok_or(FusionError::CheckFailed(
++                "expected DequantizeLinear operator",
++            ))?;
++
++        check_qlinear_params(
++            graph,
++            pat_match,
++            WeightQuantAxis::ConvOutChannels,
++            w_dq.axis,
++        )?;
++        check_quantize_output_dtype(graph, pat_match)?;
++
++        Ok(QLinearConv {
++            groups: conv.groups,
++            dilations: conv.dilations.clone(),
++            padding: conv.padding.clone(),
++            strides: conv.strides.clone(),
++        })
++    }
++}
++
++/// Fuses `QuantizeLinear(MatMul(DequantizeLinear(a), DequantizeLinear(b)))`
++/// into a `QLinearMatMul` operator.
++pub struct QLinearMatMulFusion {}
++
++impl PatternFusion for QLinearMatMulFusion {
++    type Operator = QLinearMatMul;
++
++    fn name(&self) -> &str {
++        "QLinearMatMulFusion"
++    }
++
++    fn pattern(&self) -> Pattern {
++        qdq_compute_pattern("MatMul", "matmul", false)
++    }
++
++    fn inputs(&self) -> &[&str] {
++        QDQ_PATTERN_INPUTS
++    }
++
++    fn maybe_fuse(&self, pat_match: &Match, graph: &Graph) -> Result<Self::Operator, FusionError> {
++        let w_dq: &DequantizeLinear = graph
++            .get_operator(pat_match.node_id("w_dq").unwrap())
++            .ok_or(FusionError::CheckFailed(
++                "expected DequantizeLinear operator",
++            ))?;
++
++        check_qlinear_params(graph, pat_match, WeightQuantAxis::MatMulColumns, w_dq.axis)?;
++        check_quantize_output_dtype(graph, pat_match)?;
++
++        Ok(QLinearMatMul {})
++    }
++}
++
+ /// Fuses transpose operations on an operator's inputs.
+ ///
+ /// A Transpose operator on its own will move data around in memory. In the
+diff --git a/src/optimize/tests.rs b/src/optimize/tests.rs
+index 85e78c0cdbb1823d27a32ed93381a83ad5aa08bd..ff580e20fc715b4f02170e2d88554cca29048235 100644
+--- a/src/optimize/tests.rs
++++ b/src/optimize/tests.rs
+@@ -15,11 +15,11 @@ use crate::graph::{
+ };
+ use crate::infer_shapes::InferShapeOptions;
+ use crate::ops::{
+-    Add, BatchNormalization, Cast, ComputeShape, Conv, ConvInteger, DynamicQuantizeLinear, Erf,
+-    Expand, FusedMatMul, Gather, Gelu, GroupedQueryAttentionMatMul, Identity, If, IsNaN,
+-    LayerNormalization, MatMul, MatMulInteger, Neg, Padding, Pow, RMSNormalization, ReduceMean,
+-    RepeatInterleave, Reshape, Shape, Sigmoid, Slice, Softmax, Split, Sqrt, Swish, Tanh, Transpose,
+-    Unsqueeze, Where,
++    Add, BatchNormalization, Cast, ComputeShape, Conv, ConvInteger, DequantizeLinear,
++    DynamicQuantizeLinear, Erf, Expand, FusedMatMul, Gather, Gelu, GroupedQueryAttentionMatMul,
++    Identity, If, IsNaN, LayerNormalization, MatMul, MatMulInteger, Neg, Padding, Pow, QLinearConv,
++    QLinearMatMul, QuantizeLinear, RMSNormalization, ReduceMean, RepeatInterleave, Reshape, Shape,
++    Sigmoid, Slice, Softmax, Split, Sqrt, Swish, Tanh, Transpose, Unsqueeze, Where,
+ };
+ use crate::value::{DataType, Value, ValueType};
+ 
+@@ -1326,6 +1326,613 @@ fn test_fuse_convinteger_cast_scale() {
+     })
+ }
+ 
++/// Parameters of a `QuantizeLinear(Op(DequantizeLinear, DequantizeLinear))`
++/// (QDQ) pattern around a Conv or MatMul.
++#[derive(Debug)]
++struct QdqParams {
++    x_scale: Tensor<f32>,
++    x_zero: Tensor<u8>,
++    w_scale: Tensor<f32>,
++    w_zero: Tensor<i8>,
++    y_scale: Tensor<f32>,
++    y_zero: Tensor<u8>,
++    w_dq_axis: isize,
++    q_output_dtype: Option<DataType>,
++}
++
++/// Valid per-tensor QDQ parameters.
++fn valid_qdq_params() -> QdqParams {
++    QdqParams {
++        x_scale: Tensor::from(0.1),
++        x_zero: Tensor::from(0u8),
++        w_scale: Tensor::from(0.02),
++        w_zero: Tensor::from(0i8),
++        y_scale: Tensor::from(0.15),
++        y_zero: Tensor::from(0u8),
++        w_dq_axis: 0,
++        q_output_dtype: None,
++    }
++}
++
++/// Build a `QuantizeLinear(Conv(DequantizeLinear(x), DequantizeLinear(w)))` expression.
++fn qdq_conv_expr(x: Expr, w: Expr, params: &QdqParams) -> Expr {
++    let dq_x = x.apply(
++        DequantizeLinear { axis: -1 },
++        &[
++            Expr::constant(params.x_scale.clone()),
++            Expr::constant(params.x_zero.clone()),
++        ],
++        &[OutputMeta::NoMeta],
++    );
++    let dq_w = w.apply(
++        DequantizeLinear {
++            axis: params.w_dq_axis,
++        },
++        &[
++            Expr::constant(params.w_scale.clone()),
++            Expr::constant(params.w_zero.clone()),
++        ],
++        &[OutputMeta::NoMeta],
++    );
++    dq_x.apply(
++        Conv {
++            groups: 1,
++            dilations: vec![1, 1],
++            padding: Padding::zero::<2>(),
++            strides: vec![2, 2],
++        },
++        &[dq_w],
++        &[OutputMeta::NoMeta],
++    )
++    .apply(
++        QuantizeLinear {
++            axis: -1,
++            output_dtype: params.q_output_dtype,
++        },
++        &[
++            Expr::constant(params.y_scale.clone()),
++            Expr::constant(params.y_zero.clone()),
++        ],
++        &[OutputMeta::NoMeta],
++    )
++}
++
++/// Build a `QuantizeLinear(MatMul(DequantizeLinear(a), DequantizeLinear(b)))` expression.
++fn qdq_matmul_expr(a: Expr, b: Expr, params: &QdqParams) -> Expr {
++    let dq_a = a.apply(
++        DequantizeLinear { axis: -1 },
++        &[
++            Expr::constant(params.x_scale.clone()),
++            Expr::constant(params.x_zero.clone()),
++        ],
++        &[OutputMeta::NoMeta],
++    );
++    let dq_b = b.apply(
++        DequantizeLinear {
++            axis: params.w_dq_axis,
++        },
++        &[
++            Expr::constant(params.w_scale.clone()),
++            Expr::constant(params.w_zero.clone()),
++        ],
++        &[OutputMeta::NoMeta],
++    );
++    dq_a.apply(MatMul {}, &[dq_b], &[OutputMeta::NoMeta]).apply(
++        QuantizeLinear {
++            axis: -1,
++            output_dtype: params.q_output_dtype,
++        },
++        &[
++            Expr::constant(params.y_scale.clone()),
++            Expr::constant(params.y_zero.clone()),
++        ],
++        &[OutputMeta::NoMeta],
++    )
++}
++
++#[test]
++fn test_fuse_qdq_conv() {
++    #[derive(Debug)]
++    struct Case {
++        params: QdqParams,
++        expected_op: &'static str,
++    }
++
++    // Weight constants have 3 output channels.
++    let w = || Expr::constant(Tensor::<i8>::zeros(&[3, 2, 3, 3]));
++
++    let cases = [
++        // Per-tensor parameters.
++        Case {
++            params: valid_qdq_params(),
++            expected_op: "QLinearConv",
++        },
++        // Per-channel weights, quantization axis 0.
++        Case {
++            params: QdqParams {
++                w_scale: Tensor::from([0.02, 0.03, 0.04]),
++                w_zero: Tensor::from([0i8, 1, 2]),
++                w_dq_axis: 0,
++                ..valid_qdq_params()
++            },
++            expected_op: "QLinearConv",
++        },
++        // Per-channel weights, quantization axis 0 specified as -4.
++        Case {
++            params: QdqParams {
++                w_scale: Tensor::from([0.02, 0.03, 0.04]),
++                w_zero: Tensor::from([0i8, 1, 2]),
++                w_dq_axis: -4,
++                ..valid_qdq_params()
++            },
++            expected_op: "QLinearConv",
++        },
++        // Per-channel weights along an incorrect quantization axis. The scale
++        // length matches the axis size, so the DequantizeLinear itself is
++        // valid, but the axis is not the output channel axis.
++        Case {
++            params: QdqParams {
++                w_scale: Tensor::from([0.02, 0.03]),
++                w_zero: Tensor::from([0i8, 1]),
++                w_dq_axis: 1,
++                ..valid_qdq_params()
++            },
++            expected_op: "QuantizeLinear",
++        },
++        // Per-channel activation scale.
++        Case {
++            params: QdqParams {
++                x_scale: Tensor::from([0.1, 0.2]),
++                ..valid_qdq_params()
++            },
++            expected_op: "QuantizeLinear",
++        },
++        // Per-channel activation zero point.
++        Case {
++            params: QdqParams {
++                x_zero: Tensor::from([0u8, 1]),
++                ..valid_qdq_params()
++            },
++            expected_op: "QuantizeLinear",
++        },
++        // Per-channel output zero point.
++        Case {
++            params: QdqParams {
++                y_zero: Tensor::from([0u8, 1]),
++                ..valid_qdq_params()
++            },
++            expected_op: "QuantizeLinear",
++        },
++        // Zero output scale.
++        Case {
++            params: QdqParams {
++                y_scale: Tensor::from(0.),
++                ..valid_qdq_params()
++            },
++            expected_op: "QuantizeLinear",
++        },
++        // QuantizeLinear output type matching the zero point type.
++        Case {
++            params: QdqParams {
++                q_output_dtype: Some(DataType::UInt8),
++                ..valid_qdq_params()
++            },
++            expected_op: "QLinearConv",
++        },
++        // QuantizeLinear output type not matching the zero point type.
++        Case {
++            params: QdqParams {
++                q_output_dtype: Some(DataType::Int8),
++                ..valid_qdq_params()
++            },
++            expected_op: "QuantizeLinear",
++        },
++    ];
++
++    cases.test_each(|case| {
++        let graph = qdq_conv_expr(Expr::value("x"), w(), &case.params).build_graph(["x"]);
++        let graph = optimize_graph(graph).unwrap();
++        let (_, op) = graph.get_source_node(graph.output_ids()[0]).unwrap();
++        assert_eq!(op.operator().name(), case.expected_op);
++
++        // Check attributes are propagated to the fused operator.
++        if case.expected_op == "QLinearConv" {
++            let fused = op.operator().downcast_ref::<QLinearConv>().unwrap();
++            assert_eq!(fused.strides, &[2, 2]);
++        }
++    })
++}
++
++#[test]
++fn test_fuse_qdq_matmul() {
++    #[derive(Debug)]
++    struct Case {
++        params: QdqParams,
++        expected_op: &'static str,
++    }
++
++    // Weight constants have 3 columns.
++    let b = || Expr::constant(Tensor::<i8>::zeros(&[4, 3]));
++
++    let cases = [
++        // Per-tensor parameters.
++        Case {
++            params: valid_qdq_params(),
++            expected_op: "QLinearMatMul",
++        },
++        // Per-channel weights, quantization axis 1 (also as -1).
++        Case {
++            params: QdqParams {
++                w_scale: Tensor::from([0.02, 0.03, 0.04]),
++                w_zero: Tensor::from([0i8, 1, 2]),
++                w_dq_axis: 1,
++                ..valid_qdq_params()
++            },
++            expected_op: "QLinearMatMul",
++        },
++        Case {
++            params: QdqParams {
++                w_scale: Tensor::from([0.02, 0.03, 0.04]),
++                w_zero: Tensor::from([0i8, 1, 2]),
++                w_dq_axis: -1,
++                ..valid_qdq_params()
++            },
++            expected_op: "QLinearMatMul",
++        },
++        // Per-channel weights along an incorrect quantization axis. The scale
++        // length matches the axis size, so the DequantizeLinear itself is
++        // valid, but the axis is not the output channel axis.
++        Case {
++            params: QdqParams {
++                w_scale: Tensor::from([0.02, 0.03, 0.04, 0.05]),
++                w_zero: Tensor::from([0i8, 1, 2, 3]),
++                w_dq_axis: 0,
++                ..valid_qdq_params()
++            },
++            expected_op: "QuantizeLinear",
++        },
++        // Per-channel activation scale.
++        Case {
++            params: QdqParams {
++                x_scale: Tensor::from([0.1, 0.2]),
++                ..valid_qdq_params()
++            },
++            expected_op: "QuantizeLinear",
++        },
++        // Per-channel (per-row) activation zero point.
++        Case {
++            params: QdqParams {
++                x_zero: Tensor::from([0u8, 1]),
++                ..valid_qdq_params()
++            },
++            expected_op: "QuantizeLinear",
++        },
++    ];
++
++    cases.test_each(|case| {
++        let graph = qdq_matmul_expr(Expr::value("a"), b(), &case.params).build_graph(["a"]);
++        let graph = optimize_graph(graph).unwrap();
++        let (_, op) = graph.get_source_node(graph.output_ids()[0]).unwrap();
++        assert_eq!(op.operator().name(), case.expected_op);
++
++        if case.expected_op == "QLinearMatMul" {
++            op.operator().downcast_ref::<QLinearMatMul>().unwrap();
++        }
++    })
++}
++
++#[test]
++fn test_fuse_qdq_matmul_dynamic_weights() {
++    // The weight DQ input is a dynamic value rather than a constant.
++    //
++    // Per-tensor weight parameters do not require knowing the weight shape,
++    // so the fusion still applies.
++    let graph = qdq_matmul_expr(Expr::value("a"), Expr::value("w"), &valid_qdq_params())
++        .build_graph(["a", "w"]);
++    let graph = optimize_graph(graph).unwrap();
++    let (_, op) = graph.get_source_node(graph.output_ids()[0]).unwrap();
++    assert_eq!(op.operator().name(), "QLinearMatMul");
++
++    // With per-channel weight parameters the weight rank must be known, so
++    // the fusion does not apply for dynamic weights with unknown rank.
++    let params = QdqParams {
++        w_scale: Tensor::from([0.02, 0.03]),
++        w_zero: Tensor::from([0i8, 1]),
++        w_dq_axis: 1,
++        ..valid_qdq_params()
++    };
++    let graph =
++        qdq_matmul_expr(Expr::value("a"), Expr::value("w"), &params).build_graph(["a", "w"]);
++    let graph = optimize_graph(graph).unwrap();
++    let (_, op) = graph.get_source_node(graph.output_ids()[0]).unwrap();
++    assert_eq!(op.operator().name(), "QuantizeLinear");
++}
++
++#[test]
++fn test_fuse_qdq_conv_dynamic_scale() {
++    // The scale and zero point inputs must be constants. A dynamic scale
++    // prevents fusion.
++    let x = Expr::value("x");
++    let w = Expr::constant(Tensor::<i8>::zeros(&[3, 2, 3, 3]));
++    let params = valid_qdq_params();
++
++    let dq_x = x.apply(
++        DequantizeLinear { axis: -1 },
++        &[
++            Expr::value("x_scale"),
++            Expr::constant(params.x_zero.clone()),
++        ],
++        &[OutputMeta::NoMeta],
++    );
++    let dq_w = w.apply(
++        DequantizeLinear { axis: 0 },
++        &[
++            Expr::constant(params.w_scale.clone()),
++            Expr::constant(params.w_zero.clone()),
++        ],
++        &[OutputMeta::NoMeta],
++    );
++    let expr = dq_x
++        .apply(
++            Conv {
++                groups: 1,
++                dilations: vec![1, 1],
++                padding: Padding::zero::<2>(),
++                strides: vec![1, 1],
++            },
++            &[dq_w],
++            &[OutputMeta::NoMeta],
++        )
++        .apply(
++            QuantizeLinear {
++                axis: -1,
++                output_dtype: None,
++            },
++            &[
++                Expr::constant(params.y_scale.clone()),
++                Expr::constant(params.y_zero.clone()),
++            ],
++            &[OutputMeta::NoMeta],
++        );
++    let graph = expr.build_graph(["x", "x_scale"]);
++
++    let graph = optimize_graph(graph).unwrap();
++    let (_, op) = graph.get_source_node(graph.output_ids()[0]).unwrap();
++    assert_eq!(op.operator().name(), "QuantizeLinear");
++}
++
++#[test]
++fn test_fuse_qdq_conv_zero_point_type_mismatch() {
++    // The input is u8 but its zero point is i8.
++    let x = Expr::value_with_info(
++        "x",
++        ValueType::Tensor(DataType::UInt8),
++        &dims!["batch", 2, 5, 5],
++    );
++    let w = Expr::constant(Tensor::<i8>::zeros(&[3, 2, 3, 3]));
++    let params = valid_qdq_params();
++
++    let dq_x = x.apply(
++        DequantizeLinear { axis: -1 },
++        &[
++            Expr::constant(params.x_scale.clone()),
++            Expr::constant(Tensor::from(0i8)),
++        ],
++        &[OutputMeta::NoMeta],
++    );
++    let dq_w = w.apply(
++        DequantizeLinear { axis: 0 },
++        &[
++            Expr::constant(params.w_scale.clone()),
++            Expr::constant(params.w_zero.clone()),
++        ],
++        &[OutputMeta::NoMeta],
++    );
++    let expr = dq_x
++        .apply(
++            Conv {
++                groups: 1,
++                dilations: vec![1, 1],
++                padding: Padding::zero::<2>(),
++                strides: vec![1, 1],
++            },
++            &[dq_w],
++            &[OutputMeta::NoMeta],
++        )
++        .apply(
++            QuantizeLinear {
++                axis: -1,
++                output_dtype: None,
++            },
++            &[
++                Expr::constant(params.y_scale.clone()),
++                Expr::constant(params.y_zero.clone()),
++            ],
++            &[OutputMeta::NoMeta],
++        );
++    let graph = expr.build_graph(["x"]);
++
++    let graph = optimize_graph(graph).unwrap();
++    let (_, op) = graph.get_source_node(graph.output_ids()[0]).unwrap();
++    assert_eq!(op.operator().name(), "QuantizeLinear");
++}
++
++#[test]
++fn test_fuse_qdq_conv_missing_zero_point() {
++    // DequantizeLinear without a zero point input (2 inputs instead of 3)
++    // does not match the pattern.
++    let x = Expr::value("x");
++    let w = Expr::constant(Tensor::<i8>::zeros(&[3, 2, 3, 3]));
++    let params = valid_qdq_params();
++
++    let dq_x = x.apply(
++        DequantizeLinear { axis: -1 },
++        &[Expr::constant(params.x_scale.clone())],
++        &[OutputMeta::NoMeta],
++    );
++    let dq_w = w.apply(
++        DequantizeLinear { axis: 0 },
++        &[Expr::constant(params.w_scale.clone())],
++        &[OutputMeta::NoMeta],
++    );
++    let expr = dq_x
++        .apply(
++            Conv {
++                groups: 1,
++                dilations: vec![1, 1],
++                padding: Padding::zero::<2>(),
++                strides: vec![1, 1],
++            },
++            &[dq_w],
++            &[OutputMeta::NoMeta],
++        )
++        .apply(
++            QuantizeLinear {
++                axis: -1,
++                output_dtype: None,
++            },
++            &[
++                Expr::constant(params.y_scale.clone()),
++                Expr::constant(params.y_zero.clone()),
++            ],
++            &[OutputMeta::NoMeta],
++        );
++    let graph = expr.build_graph(["x"]);
++
++    let graph = optimize_graph(graph).unwrap();
++    let (_, op) = graph.get_source_node(graph.output_ids()[0]).unwrap();
++    assert_eq!(op.operator().name(), "QuantizeLinear");
++}
++
++#[test]
++fn test_fuse_qdq_conv_with_bias() {
++    // A Conv with a bias input (3 inputs) does not match the pattern.
++    let x = Expr::value("x");
++    let w = Expr::constant(Tensor::<i8>::zeros(&[3, 2, 3, 3]));
++    let bias = Expr::constant(Tensor::<f32>::zeros(&[3]));
++    let params = valid_qdq_params();
++
++    let dq_x = x.apply(
++        DequantizeLinear { axis: -1 },
++        &[
++            Expr::constant(params.x_scale.clone()),
++            Expr::constant(params.x_zero.clone()),
++        ],
++        &[OutputMeta::NoMeta],
++    );
++    let dq_w = w.apply(
++        DequantizeLinear { axis: 0 },
++        &[
++            Expr::constant(params.w_scale.clone()),
++            Expr::constant(params.w_zero.clone()),
++        ],
++        &[OutputMeta::NoMeta],
++    );
++    let expr = dq_x
++        .apply(
++            Conv {
++                groups: 1,
++                dilations: vec![1, 1],
++                padding: Padding::zero::<2>(),
++                strides: vec![1, 1],
++            },
++            &[dq_w, bias],
++            &[OutputMeta::NoMeta],
++        )
++        .apply(
++            QuantizeLinear {
++                axis: -1,
++                output_dtype: None,
++            },
++            &[
++                Expr::constant(params.y_scale.clone()),
++                Expr::constant(params.y_zero.clone()),
++            ],
++            &[OutputMeta::NoMeta],
++        );
++    let graph = expr.build_graph(["x"]);
++
++    let graph = optimize_graph(graph).unwrap();
++    let (_, op) = graph.get_source_node(graph.output_ids()[0]).unwrap();
++    assert_eq!(op.operator().name(), "QuantizeLinear");
++}
++
++#[test]
++fn test_fuse_qdq_conv_intermediate_consumer() {
++    // The activation DequantizeLinear output is also a graph output, so the
++    // pattern cannot be fused.
++    let x = Expr::value("x");
++    let w = Expr::constant(Tensor::<i8>::zeros(&[3, 2, 3, 3]));
++    let params = valid_qdq_params();
++
++    let dq_x = x.apply(
++        DequantizeLinear { axis: -1 },
++        &[
++            Expr::constant(params.x_scale.clone()),
++            Expr::constant(params.x_zero.clone()),
++        ],
++        &[OutputMeta::NoMeta],
++    );
++    let dq_w = w.apply(
++        DequantizeLinear { axis: 0 },
++        &[
++            Expr::constant(params.w_scale.clone()),
++            Expr::constant(params.w_zero.clone()),
++        ],
++        &[OutputMeta::NoMeta],
++    );
++    let q = dq_x
++        .clone()
++        .apply(
++            Conv {
++                groups: 1,
++                dilations: vec![1, 1],
++                padding: Padding::zero::<2>(),
++                strides: vec![1, 1],
++            },
++            &[dq_w],
++            &[OutputMeta::NoMeta],
++        )
++        .apply(
++            QuantizeLinear {
++                axis: -1,
++                output_dtype: None,
++            },
++            &[
++                Expr::constant(params.y_scale.clone()),
++                Expr::constant(params.y_zero.clone()),
++            ],
++            &[OutputMeta::NoMeta],
++        );
++    let graph = Expr::make_graph(&[Expr::value("x")], &[q, dq_x]);
++
++    let graph = optimize_graph(graph).unwrap();
++    let (_, op) = graph.get_source_node(graph.output_ids()[0]).unwrap();
++    assert_eq!(op.operator().name(), "QuantizeLinear");
++}
++
++#[test]
++fn test_fuse_qdq_weight_granularity_mismatch() {
++    // Mismatched weight scale and zero point granularity prevents fusion.
++    // Dynamic weights are used so that constant propagation does not evaluate
++    // the (invalid) weight DequantizeLinear.
++    let params = QdqParams {
++        w_zero: Tensor::from([0i8, 1, 2]),
++        ..valid_qdq_params()
++    };
++
++    let graph = qdq_conv_expr(Expr::value("x"), Expr::value("w"), &params).build_graph(["x", "w"]);
++    let graph = optimize_graph(graph).unwrap();
++    let (_, op) = graph.get_source_node(graph.output_ids()[0]).unwrap();
++    assert_eq!(op.operator().name(), "QuantizeLinear");
++
++    let graph =
++        qdq_matmul_expr(Expr::value("a"), Expr::value("w"), &params).build_graph(["a", "w"]);
++    let graph = optimize_graph(graph).unwrap();
++    let (_, op) = graph.get_source_node(graph.output_ids()[0]).unwrap();
++    assert_eq!(op.operator().name(), "QuantizeLinear");
++}
++
+ #[test]
+ fn test_slice_shape_to_constant() {
+     // `Slice(Shape(X), starts, ends)` which can be simplified to a constant.
