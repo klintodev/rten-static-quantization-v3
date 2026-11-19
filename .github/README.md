@@ -1,6 +1,6 @@
 # Static quantization for RTen: a sample Harbor task
 
-Human authored LLM assisted harbor task.
+Human authored LLM assisted harbor task. For high quality coding evals, [contact us](https://www.klinto.dev)
 
 The brief asks an agent to add the ONNX `QLinearConv` and `QLinearMatMul` operators to [RTen](https://github.com/robertknight/rten), a Rust ONNX runtime. The agent also has to fuse quantize/dequantize patterns into them and add `calibrate` and `quantize` commands. Those commands must stay within 256 MiB of memory on a model with 512 MiB of weights. The full brief is in [instruction.md](../instruction.md).
 
