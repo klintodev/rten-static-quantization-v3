@@ -1,0 +1,30 @@
+{
+  "job": "2026-11-19__00-22-27",
+  "trial": "rten-static-quantization-v3__QXL5eGr",
+  "agent": "claude-code",
+  "model": "anthropic/claude-sonnet-5-5",
+  "task_digest": "sha256:65277d5f511bff5270d03e6c768b4c81e9ea5de98bbdc45645d91b702a6f1a34",
+  "matches_delivered_task": true,
+  "rewards": {
+    "reward": 0.0
+  },
+  "exception_type": null,
+  "started_at": "2026-11-19T00:22:29.253736Z",
+  "finished_at": "2026-11-19T01:22:34.936670Z",
+  "agent_execution": {
+    "started_at": "2026-11-19T00:23:24.142484Z",
+    "finished_at": "2026-11-19T01:19:10.668879Z"
+  },
+  "verifier": {
+    "started_at": "2026-11-19T01:19:34.449518Z",
+    "finished_at": "2026-11-19T01:22:34.936632Z"
+  },
+  "verifier_files": [
+    "f2p-rten.log",
+    "p2p-rten-cli.log",
+    "p2p-rten-shape-inference.log",
+    "p2p-rten.log",
+    "reward.txt",
+    "test-stdout.txt"
+  ]
+}

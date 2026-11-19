@@ -1,0 +1,30 @@
+{
+  "job": "rten-v3-public-nop",
+  "trial": "rten-static-quantization-v3__oHA9DRt",
+  "agent": "nop",
+  "model": null,
+  "task_digest": "sha256:65277d5f511bff5270d03e6c768b4c81e9ea5de98bbdc45645d91b702a6f1a34",
+  "matches_delivered_task": true,
+  "rewards": {
+    "reward": 0.0
+  },
+  "exception_type": null,
+  "started_at": "2026-11-19T15:37:17.429741Z",
+  "finished_at": "2026-11-19T15:39:55.036168Z",
+  "agent_execution": {
+    "started_at": "2026-11-19T15:37:22.184333Z",
+    "finished_at": "2026-11-19T15:37:24.419967Z"
+  },
+  "verifier": {
+    "started_at": "2026-11-19T15:37:42.100665Z",
+    "finished_at": "2026-11-19T15:39:55.036152Z"
+  },
+  "verifier_files": [
+    "f2p-rten.log",
+    "p2p-rten-cli.log",
+    "p2p-rten-shape-inference.log",
+    "p2p-rten.log",
+    "reward.txt",
+    "test-stdout.txt"
+  ]
+}

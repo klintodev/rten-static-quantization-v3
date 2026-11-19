@@ -1,0 +1,30 @@
+{
+  "job": "rten-v3-public-oracle",
+  "trial": "rten-static-quantization-v3__x6a35pe",
+  "agent": "oracle",
+  "model": null,
+  "task_digest": "sha256:65277d5f511bff5270d03e6c768b4c81e9ea5de98bbdc45645d91b702a6f1a34",
+  "matches_delivered_task": true,
+  "rewards": {
+    "reward": 1.0
+  },
+  "exception_type": null,
+  "started_at": "2026-11-19T15:37:17.549765Z",
+  "finished_at": "2026-11-19T15:40:38.398543Z",
+  "agent_execution": {
+    "started_at": "2026-11-19T15:37:22.184333Z",
+    "finished_at": "2026-11-19T15:37:24.751128Z"
+  },
+  "verifier": {
+    "started_at": "2026-11-19T15:37:42.501405Z",
+    "finished_at": "2026-11-19T15:40:38.398528Z"
+  },
+  "verifier_files": [
+    "f2p-rten.log",
+    "p2p-rten-cli.log",
+    "p2p-rten-shape-inference.log",
+    "p2p-rten.log",
+    "reward.txt",
+    "test-stdout.txt"
+  ]
+}

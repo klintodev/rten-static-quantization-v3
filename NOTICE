@@ -1,0 +1,23 @@
+This repository contains material derived from RTen.
+
+RTen: https://github.com/robertknight/rten
+Copyright (c) 2026 RTen project contributors.
+Licensed under the MIT licence or the Apache License, Version 2.0, at your option.
+
+The licence texts are in licenses/rten/, copied unchanged from RTen commit
+e77a3b6e12650512449f66843b6508ec913ebd17. RTen does not ship a NOTICE file.
+
+These parts derive from RTen and are available under RTen's terms:
+
+- solution/reference.patch is a patch against that commit. It changes RTen's
+  files and quotes RTen source lines as context.
+- tests/qlinear.rs and tests/readback.rs are compiled into RTen's crates during
+  verification. tests/upstream-tests.txt lists the names of RTen's own tests.
+- trajectories/ records an agent working in a checkout of RTen. It quotes RTen
+  source code and command output.
+- runs/ holds verifier logs from building and testing RTen.
+
+The task's Docker image downloads RTen from GitHub at that commit when it is
+built. This repository does not otherwise include RTen's source tree.
+
+This repository is not affiliated with or endorsed by the RTen project.

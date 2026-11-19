@@ -1,0 +1,44 @@
+   Compiling proc-macro2 v1.0.103
+   Compiling quote v1.0.42
+   Compiling unicode-ident v1.0.22
+   Compiling serde_core v1.0.229
+   Compiling syn v3.0.6
+   Compiling serde v1.0.229
+   Compiling serde_json v1.0.151
+   Compiling equivalent v1.0.2
+   Compiling memchr v2.7.6
+   Compiling serde_derive v1.0.229
+   Compiling foldhash v0.2.0
+   Compiling allocator-api2 v0.2.21
+   Compiling hashbrown v0.16.1
+   Compiling syn v2.0.110
+   Compiling rten-tensor v0.27.0 (/app/rten-tensor)
+   Compiling argh_shared v0.1.19
+   Compiling rten-shape-inference v0.27.0 (/app/rten-shape-inference)
+   Compiling argh_derive v0.1.19
+   Compiling rten-gemm v0.27.0 (/app/rten-gemm)
+   Compiling safetensors v0.8.0
+   Compiling memmap2 v0.9.11
+   Compiling argh v0.1.19
+   Compiling rten-serialize v0.27.0 (/app/rten-serialize)
+   Compiling rten v0.27.0 (/app)
+   Compiling rten-cli v0.27.0 (/app/rten-cli)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 28.79s
+     Running unittests src/main.rs (/tmp/rten-verifier-target.1Ksz9b/debug/deps/rten-ba480251ad42618e)
+
+running 12 tests
+test dim_size::tests::test_matches ... ok
+test dim_size::tests::test_parse ... ok
+test dim_size::tests::test_sort_dedup ... ok
+test input_generator::tests::test_generate_empty_range ... ok
+test input_generator::tests::test_generate_name_heuristics ... ok
+test input_info::tests::test_group_name_parse ... ok
+test input_generator::tests::test_generate_value_range ... ok
+test input_info::tests::test_group_name_to_string ... ok
+test input_range::tests::test_matches ... ok
+test input_range::tests::test_parse ... ok
+test input_range::tests::test_sort_dedup ... ok
+test name_value::tests::test_split ... ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

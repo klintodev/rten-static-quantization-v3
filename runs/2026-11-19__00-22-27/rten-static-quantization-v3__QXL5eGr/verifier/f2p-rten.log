@@ -1,0 +1,22 @@
+   Compiling rten v0.27.0 (/app)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 25.58s
+     Running unittests src/lib.rs (/tmp/rten-verifier-target.1Ksz9b/debug/deps/rten-16a0c245103f33f1)
+
+running 14 tests
+test model::harbor_qlinear::f2p_conv_1d_auto_padding ... ok
+test model::harbor_qlinear::f2p_conservative_qdq_fusion ... ok
+test model::harbor_qlinear::f2p_matmul_batch_and_lhs_vector ... ok
+test model::harbor_qlinear::f2p_matmul_rhs_vector_has_one_output_column ... ok
+test model::harbor_qlinear::f2p_matmul_signedness_and_channels ... ok
+test model::harbor_qlinear::f2p_conv_channels_bias_and_attributes ... ok
+test model::harbor_qlinear::f2p_nonbinary_scales ... ok
+test model::harbor_qlinear::f2p_qdq_conv_bias_eligibility ... ok
+test model::harbor_qlinear::f2p_qdq_conv_fusion ... ok
+test model::harbor_qlinear::f2p_qdq_matmul_fusion ... ok
+test model::harbor_qlinear::f2p_shapes_and_output_types ... ok
+test model::harbor_qlinear::f2p_rounding_zero_point_and_saturation ... ok
+test model::harbor_qlinear::f2p_wide_accumulation ... ok
+test model::harbor_qlinear::f2p_validation ... ok
+
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 561 filtered out; finished in 0.73s
+

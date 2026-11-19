@@ -1,0 +1,17 @@
+   Compiling rten-shape-inference v0.27.0 (/app/rten-shape-inference)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.45s
+     Running unittests src/lib.rs (/tmp/rten-verifier-target.1Ksz9b/debug/deps/rten_shape_inference-07bb108175c7efb7)
+
+running 9 tests
+test ops::conv_pool::tests::test_conv ... ok
+test ops::conv_pool::tests::test_conv_transpose ... ok
+test ops::conv_pool::tests::test_global_pool ... ok
+test ops::conv_pool::tests::test_pool ... ok
+test ops::matmul::tests::test_gemm ... ok
+test ops::conv_pool::tests::test_pool_ceil_mode ... ok
+test ops::matmul::tests::test_matmul ... ok
+test ops::matmul::tests::test_matmul_n_bits ... ok
+test ops::quantize::tests::test_dynamic_quantize_linear ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 128 filtered out; finished in 0.00s
+

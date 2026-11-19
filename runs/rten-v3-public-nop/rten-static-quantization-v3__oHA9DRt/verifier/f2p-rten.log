@@ -1,0 +1,115 @@
+   Compiling rten v0.27.0 (/app)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 18.56s
+     Running unittests src/lib.rs (/tmp/rten-verifier-target.BMmaQk/debug/deps/rten-16a0c245103f33f1)
+
+running 14 tests
+test model::harbor_qlinear::f2p_conv_1d_auto_padding ... FAILED
+test model::harbor_qlinear::f2p_conv_channels_bias_and_attributes ... FAILED
+test model::harbor_qlinear::f2p_matmul_batch_and_lhs_vector ... FAILED
+test model::harbor_qlinear::f2p_matmul_rhs_vector_has_one_output_column ... FAILED
+test model::harbor_qlinear::f2p_matmul_signedness_and_channels ... FAILED
+test model::harbor_qlinear::f2p_nonbinary_scales ... FAILED
+test model::harbor_qlinear::f2p_conservative_qdq_fusion ... FAILED
+test model::harbor_qlinear::f2p_qdq_conv_fusion ... FAILED
+test model::harbor_qlinear::f2p_qdq_conv_bias_eligibility ... FAILED
+test model::harbor_qlinear::f2p_rounding_zero_point_and_saturation ... FAILED
+test model::harbor_qlinear::f2p_shapes_and_output_types ... FAILED
+test model::harbor_qlinear::f2p_qdq_matmul_fusion ... FAILED
+test model::harbor_qlinear::f2p_validation ... FAILED
+test model::harbor_qlinear::f2p_wide_accumulation ... FAILED
+
+failures:
+
+---- model::harbor_qlinear::f2p_conv_1d_auto_padding stdout ----
+
+thread 'model::harbor_qlinear::f2p_conv_1d_auto_padding' (1731) panicked at /tests/qlinear.rs:398:10:
+valid quantized ONNX model must load: LoadError { inner: OperatorInvalid(OperatorUnavailable { name: Some("QLinearConv") }), node: Some("compute") }
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- model::harbor_qlinear::f2p_conv_channels_bias_and_attributes stdout ----
+
+thread 'model::harbor_qlinear::f2p_conv_channels_bias_and_attributes' (1732) panicked at /tests/qlinear.rs:398:10:
+valid quantized ONNX model must load: LoadError { inner: OperatorInvalid(OperatorUnavailable { name: Some("QLinearConv") }), node: Some("compute") }
+
+---- model::harbor_qlinear::f2p_matmul_batch_and_lhs_vector stdout ----
+
+thread 'model::harbor_qlinear::f2p_matmul_batch_and_lhs_vector' (1733) panicked at /tests/qlinear.rs:398:10:
+valid quantized ONNX model must load: LoadError { inner: OperatorInvalid(OperatorUnavailable { name: Some("QLinearMatMul") }), node: Some("compute") }
+
+---- model::harbor_qlinear::f2p_matmul_rhs_vector_has_one_output_column stdout ----
+
+thread 'model::harbor_qlinear::f2p_matmul_rhs_vector_has_one_output_column' (1740) panicked at /tests/qlinear.rs:398:10:
+valid quantized ONNX model must load: LoadError { inner: OperatorInvalid(OperatorUnavailable { name: Some("QLinearMatMul") }), node: Some("compute") }
+
+---- model::harbor_qlinear::f2p_matmul_signedness_and_channels stdout ----
+
+thread 'model::harbor_qlinear::f2p_matmul_signedness_and_channels' (1745) panicked at /tests/qlinear.rs:398:10:
+valid quantized ONNX model must load: LoadError { inner: OperatorInvalid(OperatorUnavailable { name: Some("QLinearMatMul") }), node: Some("compute") }
+
+---- model::harbor_qlinear::f2p_nonbinary_scales stdout ----
+
+thread 'model::harbor_qlinear::f2p_nonbinary_scales' (1750) panicked at /tests/qlinear.rs:398:10:
+valid quantized ONNX model must load: LoadError { inner: OperatorInvalid(OperatorUnavailable { name: Some("QLinearMatMul") }), node: Some("compute") }
+
+---- model::harbor_qlinear::f2p_conservative_qdq_fusion stdout ----
+
+thread 'model::harbor_qlinear::f2p_conservative_qdq_fusion' (1730) panicked at /tests/qlinear.rs:810:9:
+expected QLinearMatMul fusion
+
+---- model::harbor_qlinear::f2p_qdq_conv_fusion stdout ----
+
+thread 'model::harbor_qlinear::f2p_qdq_conv_fusion' (1754) panicked at /tests/qlinear.rs:810:9:
+expected QLinearConv fusion
+
+---- model::harbor_qlinear::f2p_qdq_conv_bias_eligibility stdout ----
+
+thread 'model::harbor_qlinear::f2p_qdq_conv_bias_eligibility' (1753) panicked at /tests/qlinear.rs:1005:13:
+assertion `left == right` failed
+  left: false
+ right: true
+
+---- model::harbor_qlinear::f2p_rounding_zero_point_and_saturation stdout ----
+
+thread 'model::harbor_qlinear::f2p_rounding_zero_point_and_saturation' (1756) panicked at /tests/qlinear.rs:398:10:
+valid quantized ONNX model must load: LoadError { inner: OperatorInvalid(OperatorUnavailable { name: Some("QLinearMatMul") }), node: Some("compute") }
+
+---- model::harbor_qlinear::f2p_shapes_and_output_types stdout ----
+
+thread 'model::harbor_qlinear::f2p_shapes_and_output_types' (1757) panicked at /tests/qlinear.rs:398:10:
+valid quantized ONNX model must load: LoadError { inner: OperatorInvalid(OperatorUnavailable { name: Some("QLinearMatMul") }), node: Some("compute") }
+
+---- model::harbor_qlinear::f2p_qdq_matmul_fusion stdout ----
+
+thread 'model::harbor_qlinear::f2p_qdq_matmul_fusion' (1755) panicked at /tests/qlinear.rs:810:9:
+expected QLinearMatMul fusion
+
+---- model::harbor_qlinear::f2p_validation stdout ----
+
+thread 'model::harbor_qlinear::f2p_validation' (1758) panicked at /tests/qlinear.rs:398:10:
+valid quantized ONNX model must load: LoadError { inner: OperatorInvalid(OperatorUnavailable { name: Some("QLinearMatMul") }), node: Some("compute") }
+
+---- model::harbor_qlinear::f2p_wide_accumulation stdout ----
+
+thread 'model::harbor_qlinear::f2p_wide_accumulation' (1759) panicked at /tests/qlinear.rs:398:10:
+valid quantized ONNX model must load: LoadError { inner: OperatorInvalid(OperatorUnavailable { name: Some("QLinearMatMul") }), node: Some("compute") }
+
+
+failures:
+    model::harbor_qlinear::f2p_conservative_qdq_fusion
+    model::harbor_qlinear::f2p_conv_1d_auto_padding
+    model::harbor_qlinear::f2p_conv_channels_bias_and_attributes
+    model::harbor_qlinear::f2p_matmul_batch_and_lhs_vector
+    model::harbor_qlinear::f2p_matmul_rhs_vector_has_one_output_column
+    model::harbor_qlinear::f2p_matmul_signedness_and_channels
+    model::harbor_qlinear::f2p_nonbinary_scales
+    model::harbor_qlinear::f2p_qdq_conv_bias_eligibility
+    model::harbor_qlinear::f2p_qdq_conv_fusion
+    model::harbor_qlinear::f2p_qdq_matmul_fusion
+    model::harbor_qlinear::f2p_rounding_zero_point_and_saturation
+    model::harbor_qlinear::f2p_shapes_and_output_types
+    model::harbor_qlinear::f2p_validation
+    model::harbor_qlinear::f2p_wide_accumulation
+
+test result: FAILED. 0 passed; 14 failed; 0 ignored; 0 measured; 537 filtered out; finished in 0.01s
+
+error: test failed, to rerun pass `-p rten --lib`
